@@ -1,0 +1,513 @@
+Kenwood TK-840 / uPD78312AGF3563BE
+Mask-ROM resident API: 1F1x trampoline entries
+=================================================
+
+Source dump SHA-256:
+  0000-1fff.bin  0572a52ad964ff67afc25feb0dbde5e7ad279cc5d00c47cc5ba1f9b2ae242543
+
+Companion external-flash dump used to identify callers:
+  8000-fdff.bin  f5990f3454d7c6044ab83a6e2dd81df20cf99c57e495bc61e10d74d95bb1aacd
+
+Scope
+-----
+This file documents every valid trampoline entry in 0x1F10-0x1F1F.
+The table itself is made of 3-byte absolute branches, so the valid entries in
+this range are:
+
+  1F12 -> 0116
+  1F15 -> 020F
+  1F18 -> 0773
+  1F1B -> 071A
+  1F1E -> 075B
+
+There are no trampoline entries at 1F10, 1F11, 1F13, etc.; those addresses
+fall inside the three-byte entries above.
+
+Each entry is a BR !target trampoline.  Application firmware can CALL the
+stable 1Fxx address, the trampoline branches into the resident implementation,
+and the implementation's RET returns directly to the application caller.
+
+Important disassembly note
+--------------------------
+The local disassembler originally rendered short-direct addresses 00h-1Fh as
+FE00h-FE1Fh.  On the uPD78312 these short-direct values select SFRs at
+FF00h-FF1Fh; short-direct 20h-FFh selects internal RAM at FE20h-FEFFh.
+The descriptions below use the corrected hardware names.  In particular:
+
+  short 00h, bit 1 = P0.1
+  short 03h, bit 6 = P3.6
+
+This correction is important for the EEPROM routines: P0.1 is the serial
+clock line and P3.6 is the EEPROM serial-data line.
+
+
+Quick reference
+---------------
+
+Entry  Target  Function                                  Defined result
+-----  ------  ----------------------------------------  -----------------------------
+1F12   0116    Interrupt-controller baseline init        Interrupt-control SFRs set
+1F15   020F    Radio family/RF-split strap detection     FED3.4/FEDA.0/FEDF.4 flags
+1F18   0773    AT24C02 multi-byte/page write             CY status, B/HL advanced
+1F1B   071A    AT24C02 random single-byte read           FE2A and A = EEPROM byte
+1F1E   075B    AT24C02 single-byte write                 CY = final data ACK/NACK
+
+
+1F12 -> 0116 : interrupt-controller baseline initialization
+------------------------------------------------------------
+Purpose:
+  Establishes the mask-ROM's baseline interrupt-control state.  It consists
+  entirely of immediate writes to interrupt-control SFRs followed by RET.
+
+Inputs:
+  None.  No register or RAM arguments are read.
+
+Defined hardware output / side effects:
+
+  CRIC00 = 41h
+  CRIC01 = 41h
+  CRIC10 = 41h
+  CRIC11 = 41h
+  EXIC0  = 41h
+  EXIC1  = 41h
+  EXIC2  = 41h
+
+  TMIC0  = 40h
+  TMIC1  = 80h
+  TMIC2  = 40h
+
+  SEIC   = 47h
+  SRIC   = 47h
+  STIC   = 47h
+  ADIC   = 47h
+  TBIC   = 47h
+
+Output / return:
+  No value is returned in A, AX, memory, or CY.  The SFR configuration above
+  is the result.
+
+Register preservation:
+  The body does not modify general registers.  It performs only MOV SFR,#imm
+  operations and RET.  Treat the interrupt-control SFRs listed above as the
+  complete intentional side effect of this routine.
+
+Known callers:
+  Internal mask ROM:
+    0061, 0D50, 11A9
+
+  TK-840 external firmware 8355:
+    9879, A478, B358, E37F
+
+Calling notes:
+  This is suitable as a resident "initialize interrupt controller" service,
+  but it is not merely a software-variable initializer.  Calling it later in
+  a running application will overwrite the current interrupt configuration.
+
+Confidence:
+  HIGH.  The routine is only 46 bytes long and has no hidden control flow or
+  callees; every instruction and side effect is accounted for.
+
+
+1F15 -> 020F : radio family / RF-split hardware strap decoder
+--------------------------------------------------------------
+Purpose:
+  Reads two analog hardware-identification inputs and converts them into three
+  resident RAM flag bits.  Those flags are later used by the mask ROM to
+  construct the radio's family/model identification.
+
+Inputs:
+  No register or RAM arguments.
+
+  Hardware inputs:
+    AN3 - first family-selection conversion
+    AN2 - second band/model-selection conversion
+
+  The routine programs the A/D converter itself.  It does not expect the
+  caller to initialize ADM first.
+
+A/D sequence:
+  1. Start conversion with ADM = 87h  -> AN3
+  2. Wait for conversion-complete, servicing the watchdog while waiting
+  3. Read ADCR and compare against 7Fh
+  4. Start conversion with ADM = 85h  -> AN2
+  5. Wait the same way
+  6. Read ADCR and classify the result
+  7. Set ADM = 00h before returning
+
+First result -- AN3:
+
+  AN3 <  7Fh  -> FED3.4 = 0
+  AN3 >= 7Fh  -> FED3.4 = 1
+
+Second result -- AN2, when FED3.4 = 1:
+
+  AN2 <  7Fh  -> FEDA.0 = 0
+  AN2 >= 7Fh  -> FEDA.0 = 1
+
+  FEDF.4 is not modified on this path.
+
+Second result -- AN2, when FED3.4 = 0:
+
+  AN2 <  55h             -> FEDA.0 = 1, FEDF.4 = 0
+  55h <= AN2 < AAh       -> FEDA.0 = 0, FEDF.4 = 1
+  AN2 >= AAh             -> FEDA.0 = 0, FEDF.4 = 0
+
+How the mask ROM interprets these flags:
+  Resident routine 1089 uses exactly these bits to select the model ID.
+
+  FED3.4  FEDA.0  FEDF.4   Selected identification
+  ------  ------  -------   -----------------------
+     1       1       x      M940B1
+     1       0       x      M941B1
+     0       0       0      M890B1
+     0       0       1      M890B2
+     0       1       0      M890B3
+
+  ('x' means FEDF.4 is ignored for that family.)
+
+Why this matches the actual radios:
+  The TK-840 service manual connects:
+
+    AN3 = GND
+    AN2 = K/K2/K3 band input
+
+  Therefore a TK-840 naturally takes the FED3.4=0 branch and uses the three
+  AN2 ranges to distinguish its three UHF RF splits.  Its programming ID is
+  the M890B1/B2/B3 family.
+
+  The TK-940/941 service manual connects:
+
+    AN3 = +5 V
+    AN2 = 800/900 MHz band input
+
+  Therefore those radios naturally take FED3.4=1, and the single AN2 threshold
+  distinguishes the 800-MHz TK-940 from the 900-MHz TK-941.  This is strong
+  evidence that the same mask ROM was intentionally designed for all three
+  models.
+
+Defined return state:
+  A = raw 8-bit result of the second conversion (AN2)
+  ADM = 00h
+
+  The stable, intended result is the three RAM flag bits above.  Callers in
+  the resident code use those flags rather than treating A as the API result.
+
+Clobbers / side effects:
+  - A is overwritten with ADC results.
+  - ADM is changed during the operation and is 00h on return.
+  - ADIC bits 6 and 7 are manipulated while starting/waiting for conversions.
+  - FED3.4, FEDA.0, and sometimes FEDF.4 are modified as described above.
+  - condition flags are not a defined return value.
+  - the watchdog is refreshed while waiting for each conversion.
+
+Known callers:
+  Internal mask ROM:
+    006D, 0D5C, 11B5
+
+  TK-840 external firmware 8355:
+    A47B, B35B, E382
+
+Confidence:
+  VERY HIGH.  Both ADC conversions and all threshold branches are fully
+  traced, the resulting RAM flags lead directly to the five known model-ID
+  strings, and the AN2/AN3 wiring in the TK-840 and TK-940/941 service manuals
+  independently matches the decoded decision tree.
+
+
+1F18 -> 0773 : AT24C02 multi-byte/page write
+------------------------------------------------
+Purpose:
+  Writes one or more sequential bytes to the external AT24C02 serial EEPROM.
+  The device address is hard-coded as A0h (write).
+
+Bus implementation:
+  P0.1 = SCL
+  P3.6 = SDA
+
+  0791 = START condition
+  07A9 = STOP condition
+  07E6 = transmit one byte and sample the slave ACK into CY
+
+  07E6 returns:
+    CY = 0  slave ACK
+    CY = 1  slave NACK
+
+Inputs:
+  FE29 = 8-bit EEPROM word address
+  HL   = source-buffer pointer
+  B    = number of data bytes to send
+
+  B should be nonzero.  The routine sends a byte before its DEC B loop, so
+  B=00h is not a zero-length request; it would wrap and behave as a 256-byte
+  transfer request.  Treat B=0 as invalid for normal use.
+
+Transaction performed:
+
+  START
+  send A0h                   ; AT24C02 device address, WRITE
+  if NACK: restart and retry ; indefinite ACK polling
+  send FE29                  ; 8-bit EEPROM word address
+
+  repeat:
+      A = [HL++]
+      send A
+      if NACK: abort data loop
+      B--
+  until B == 0
+
+  STOP
+  RET
+
+Successful return:
+  CY = 0
+  B  = 0
+  HL = original HL + original B
+
+  FE29 is unchanged.
+
+Data-byte NACK return:
+  CY = 1
+  STOP is still generated.
+
+  HL has already advanced past the byte whose transmission failed, because
+  the source byte is fetched with MOV A,[HL+] before it is sent.
+
+  B has NOT yet been decremented for the failed byte, so B represents the
+  failed byte plus all bytes that would have followed it.
+
+ACK handling details:
+  - The initial A0h device-address phase IS checked.
+  - A NACK there causes an indefinite retry from a fresh START.  This is also
+    how the code waits for completion of a previous EEPROM write cycle.
+  - The ACK after the FE29 word-address byte is not explicitly tested.
+  - Every data-byte ACK is tested.
+  - There is no timeout in the ACK-poll loop.
+
+AT24C02 page-size constraint:
+  The AT24C02 is an 8-byte-page device.  This ROM routine does NOT enforce an
+  8-byte maximum and does NOT prevent a transfer from crossing a page
+  boundary.  AT24C02 hardware wraps the low three address bits within the
+  same page when a page write crosses that boundary.
+
+  Therefore a caller that wants an ordinary sequential write must ensure:
+
+    1 <= B <= 8
+
+  and must not cross an 8-byte EEPROM page boundary in a single call.
+
+Write-cycle timing:
+  STOP starts the EEPROM's internally timed nonvolatile write cycle.  1F18
+  does not wait for completion after STOP.  A subsequent EEPROM operation
+  naturally waits if needed because its first A0h address transmission is
+  ACK-polled until the EEPROM responds.
+
+Register / state clobbers:
+  - A is scratch/destructive.
+  - C is used by the serial-bit transmitter and is destructive.
+  - HL and B are defined in/out registers as described above.
+  - CY is the defined final data-byte ACK/NACK result.
+  - FE29 and the source RAM bytes are not modified.
+  - P0.1/P3.6/PM3.6 are manipulated to generate the two-wire bus waveform.
+
+Known callers in TK-840 firmware 8355:
+  B872 and B892 call 1F18.
+
+  Those callers use two-byte writes and set FE29 to F4h or F6h before the
+  call, demonstrating the intended HL/B/FE29 calling convention in live
+  application firmware.
+
+Confidence:
+  VERY HIGH.  The complete transaction, ACK behavior, pointer/count behavior,
+  START/STOP generation, and bit-level transmitter are all traced.  Kenwood's
+  service documentation independently identifies IC201 as an AT24C02-class
+  serial EEPROM with SDA/SCL pins.
+
+
+1F1B -> 071A : AT24C02 random single-byte read
+------------------------------------------------
+Purpose:
+  Reads one byte from an arbitrary 8-bit word address in the AT24C02 EEPROM.
+
+Inputs:
+  FE29 = 8-bit EEPROM word address
+
+No pointer or count argument is required.
+
+Transaction performed:
+
+  START
+  send A0h                    ; device address, WRITE
+  if NACK: restart and retry  ; indefinite ACK polling
+  send FE29                   ; set EEPROM word-address pointer
+
+  repeated START
+  send A1h                    ; device address, READ
+  receive one byte
+  FE2A = received byte
+  send NACK                   ; terminate one-byte read
+  STOP
+  RET
+
+Outputs:
+  FE2A = byte read from EEPROM
+  A    = same received byte on return
+
+  FE29 is unchanged.
+
+ACK handling details:
+  - The first A0h device-address transmission is ACK-polled indefinitely.
+    This waits out any previous EEPROM internal write cycle.
+  - The ACK after the FE29 word address is not explicitly tested.
+  - The ACK after the repeated-start A1h read address is not explicitly
+    tested.
+  - After receiving the one data byte, the MCU deliberately sends NACK, as
+    required to terminate a one-byte random read, then sends STOP.
+
+CY on return:
+  CY is NOT a status result for this routine.  The receive-byte routine shifts
+  sampled SDA bits through CY, and the subsequent NACK/STOP helpers do not
+  convert CY into an API status value.  Treat CY as undefined/data-dependent.
+
+Register / state clobbers:
+  - A = defined received byte.
+  - C is scratch/destructive in the bit-level serial routines.
+  - CY is data-dependent and not a status output.
+  - B, DE, and HL are not used by this wrapper's data path.
+  - FE29 is preserved; FE2A is overwritten with the result.
+  - P0.1/P3.6/PM3.6 are manipulated for the two-wire bus.
+
+Known callers:
+  No direct CALL 1F1B was found in TK-840 external firmware 8355.
+
+  Internal mask-ROM callers exist at:
+    102E and 1073
+
+  Therefore this is unquestionably a live resident service even though the
+  8355 application image does not call its trampoline directly.
+
+Confidence:
+  VERY HIGH.  The full random-read sequence is explicit and matches the
+  standard AT24C02 protocol byte-for-byte.
+
+
+1F1E -> 075B : AT24C02 single-byte write
+------------------------------------------------
+Purpose:
+  Writes one byte to an arbitrary 8-bit word address in the AT24C02 EEPROM.
+  This is the simple one-byte companion to the 1F18 multi-byte/page writer.
+
+Inputs:
+  FE29 = 8-bit EEPROM word address
+  FE2B = data byte to write
+
+Transaction performed:
+
+  START
+  send A0h                    ; device address, WRITE
+  if NACK: restart and retry  ; indefinite ACK polling
+  send FE29                   ; EEPROM word address
+  send FE2B                   ; one data byte
+  STOP
+  RET
+
+Defined return status:
+  CY is preserved from the ACK sample after transmitting FE2B:
+
+    CY = 0  data byte ACKed
+    CY = 1  data byte NACKed
+
+  The STOP helper does not overwrite CY.
+
+ACK handling details:
+  - The first A0h device-address transmission is checked and ACK-polled
+    indefinitely until the EEPROM responds.
+  - The ACK after FE29 is not explicitly tested.
+  - The final data-byte ACK becomes the return CY status.
+  - There is no post-STOP wait for the internal write cycle.
+
+Write-cycle timing:
+  STOP begins the EEPROM's internally timed byte-write cycle.  A subsequent
+  EEPROM access will automatically wait for completion because these ROM
+  routines ACK-poll the A0h device address before starting the next operation.
+
+Register / memory effects:
+  FE29 = preserved
+  FE2B = preserved
+  A    = scratch/destructive
+  C    = scratch/destructive
+  CY   = defined final data ACK/NACK status
+
+  B, DE, and HL are not required as arguments.
+
+  P0.1/P3.6/PM3.6 are manipulated for the two-wire bus.
+
+Known callers:
+  No direct CALL 1F1E was found in TK-840 external firmware 8355.
+
+  Internal mask-ROM callers exist at:
+    104A, 1067, 1085
+
+Confidence:
+  VERY HIGH.  The transaction and calling convention are completely traced
+  and match the AT24C02 byte-write protocol.
+
+
+Shared low-level EEPROM implementation
+--------------------------------------
+The three EEPROM API entries share the following resident helpers:
+
+  0791  generate START
+  07A9  generate STOP
+  07C6  transmit NACK after a read
+  07D6  transmit ACK after an intermediate read byte
+  07E6  transmit byte; CY=0 ACK, CY=1 NACK
+  0813  receive byte into A
+  0831  short bus timing delay
+
+Bus pins:
+
+  P0.1 = SCL
+  P3.6 = SDA
+
+P3.6 changes direction through PM3.6 so the MCU can release/read SDA for ACK
+and receive cycles.  This is a software/bit-banged two-wire implementation;
+it does not use the uPD78312's serial-port peripheral for the EEPROM.
+
+The hard-coded control bytes A0h/A1h imply an AT24C02 slave-address field of
+000, consistent with A2/A1/A0 being tied for that device implementation.
+
+
+Completeness assessment
+-----------------------
+All five valid 1F1x trampoline entries have now been traced to normal RET and
+have identified inputs, outputs, memory/SFR side effects, and relevant register
+clobbers.  No unresolved branch, indirect dispatch, or unidentified callee is
+required to understand the calling convention of any of these five entries.
+
+The only deliberately non-symbolic portion is the detailed bit-field meaning
+of every value written by 1F12's interrupt-control registers.  That does not
+leave its API behavior unknown: the exact SFR outputs are listed above.  It
+only avoids assigning speculative names to individual control bits that are
+not needed to call the routine correctly.
+
+Likewise, 1F15's function is fully determined from its code and downstream
+model-ID consumer.  The service manuals independently confirm the exact AN2
+and AN3 hardware straps for the TK-840 versus TK-940/941 family.
+
+No 1F1x entry remains unidentified.
+
+
+Cross-checks used
+-----------------
+- NEC uPD78312/uPD78312A architecture and instruction semantics.
+- Kenwood TK-840/(N) service manual, semiconductor-data pages:
+    IC201 AT24C02-class EEPROM; uPD78312 pin functions;
+    AN2 = K/K2/K3 band input; AN3 = GND;
+    P0.1 shared clock; P3.6 EEPROM data.
+- Kenwood TK-940/941 service manual, semiconductor-data pages:
+    same 78312AGF3563BE main CPU;
+    IC201 AT24C02 serial EEPROM;
+    AN2 = 800/900-MHz band input; AN3 = +5 V.
+- Atmel/Microchip AT24C02 protocol documentation:
+    256 x 8 organization, A0h/A1h style control-byte transactions,
+    random read, byte write, ACK polling, and 8-byte page writes.

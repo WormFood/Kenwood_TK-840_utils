@@ -1,0 +1,508 @@
+Kenwood TK-840 / uPD78312AGF3563BE
+Mask-ROM resident API: 1F4x trampoline entries
+=================================================
+
+Source dump SHA-256:
+  0000-1fff.bin  0572a52ad964ff67afc25feb0dbde5e7ad279cc5d00c47cc5ba1f9b2ae242543
+
+Companion external-flash dump used to identify callers/callbacks:
+  8000-fdff.bin  f5990f3454d7c6044ab83a6e2dd81df20cf99c57e495bc61e10d74d95bb1aacd
+
+Scope
+-----
+This file documents every valid trampoline entry in 0x1F40-0x1F4F.
+The table is composed of 3-byte absolute branches:
+
+  1F42 -> 0877
+  1F45 -> 0838
+  1F48 -> 1129
+  1F4B -> 1089
+
+There are no valid trampoline entries at 1F40, 1F41, 1F4E, or 1F4F.
+The first valid entry in this decade is 1F42 because the preceding 1F3F entry
+occupies bytes 1F3F-1F41.
+
+Quick reference
+---------------
+
+Entry  Target  Function                                         Defined result
+-----  ------  -----------------------------------------------  ----------------------------
+1F42   0877    Runtime/cooperative AT24C02 single-byte write    EEPROM byte written
+1F45   0838    Runtime/cooperative AT24C02 random byte read     FE2A = EEPROM byte
+1F48   1129    Generic 64-byte AT29C256 page writer             one flash page programmed
+1F4B   1089    Build 6-byte radio model-identification field    FEC0-FEC5 filled
+
+
+IMPORTANT EXTERNAL CALLBACK CONTRACT FOR 1F42/1F45
+--------------------------------------------------
+Unlike the simpler EEPROM routines exported at 1F1B and 1F1E, the 1F42 and
+1F45 implementations repeatedly CALL CPU address 8235h between I2C bus
+operations.
+
+In TK-840 firmware 8355:
+
+  8235: BR 8381h
+
+The 8381h routine is real application/background-service code, not a delay or
+NOP.  It conditionally performs application work depending on resident state.
+Therefore 8235h is effectively an EXTERNAL APPLICATION SERVICE HOOK called by
+these mask-ROM routines.
+
+Consequences for replacement firmware:
+
+  * If 1F42 or 1F45 is used, executable address 8235h MUST contain a valid
+    callable routine.
+
+  * If no cooperative/background servicing is required, the safest minimal
+    implementation is a RET-compatible stub at 8235h.
+
+  * Do not assume general-purpose register or flag results survive the 8235h
+    callback unless your own replacement hook deliberately preserves them.
+
+The resident routines themselves reload the values they require after each
+callback, so their stable software interface is through FE29/FE2A/FE2B rather
+than through transient register contents.
+
+
+1F42 -> 0877 : runtime/cooperative AT24C02 single-byte write
+----------------------------------------------------------------
+Purpose:
+  Writes one byte to the external AT24C02 serial EEPROM while periodically
+  yielding to the external application's fixed service hook at 8235h.
+
+  Functionally this is the cooperative/runtime counterpart of:
+
+      1F1E -> 075B
+
+  Both perform the same basic EEPROM single-byte write.  1F42 adds calls to
+  the external 8235h hook between bus operations.
+
+EEPROM/bus interface:
+  P0.1 = SCL
+  P3.6 = SDA
+
+  0791 = START condition
+  07A9 = STOP condition
+  07E6 = transmit one byte and sample slave ACK into CY
+
+Inputs:
+  FE29 = 8-bit AT24C02 word address
+  FE2B = data byte to write
+
+No register input is required.
+
+Transaction performed:
+
+  CALL 8235h                  ; application/background service hook
+
+retry_device:
+  START
+  send A0h                    ; AT24C02 device address, WRITE
+  if device NACK:
+      restart retry_device    ; normal EEPROM ACK polling
+
+  CALL 8235h
+  send FE29                   ; EEPROM word address
+
+  CALL 8235h
+  send FE2B                   ; data byte
+
+  CALL 8235h
+  STOP
+
+  CALL 8235h
+  RET
+
+Detailed control flow:
+
+  0877  CALL 8235
+  087A  CALL 0791             START
+  087D  A = A0h
+  087F  CALL 07E6             send device-write address
+  0882  BC 0877               retry whole sequence while device NACKs
+  0884  CALL 8235
+  0887  A = FE29
+  0889  CALL 07E6             send EEPROM word address
+  088C  CALL 8235
+  088F  A = FE2B
+  0891  CALL 07E6             send data byte
+  0894  CALL 8235
+  0897  CALL 07A9             STOP
+  089A  CALL 8235
+  089D  RET
+
+Defined result:
+  The requested byte has been presented to the EEPROM write transaction and a
+  STOP condition has been generated.
+
+  FE29 and FE2B are not intentionally modified by the resident routine.
+
+Return status:
+  There is NO reliable CY or A return-status contract from 1F42 because the
+  final operation before RET is the external 8235h callback.  Any ACK state
+  produced by the I2C bit-banger can be overwritten by that callback.
+
+  The routine explicitly retries only the initial A0h device-address ACK.
+  It does not branch on the word-address or data-byte ACK results.
+
+Register/clobber notes:
+  The I2C primitives use A and C internally.  More importantly, the 8235h
+  hook resides in external application firmware, so no general-register or
+  PSW result should be treated as part of the mask-ROM API contract.
+
+Hardware effects:
+  Generates a complete I2C write transaction on P0.1/P3.6.
+
+Known TK-840 firmware 8355 callers:
+  A88Dh
+  B12Ch
+  B13Fh
+  B14Ah
+  B155h
+  B169h
+
+  (Addresses above are CPU addresses, not file offsets.)
+
+Usage note for custom firmware:
+  If using this routine, provide a callable routine at 8235h.  A simple RET
+  there should convert this effectively into a cooperative-hook-free variant,
+  although 1F1E already exists as the resident non-hooked write service.
+
+Confidence:
+  VERY HIGH.  The complete transaction is visible, the A0h device address and
+  FE29/FE2B parameter usage exactly match the already-decoded 1F1E AT24C02
+  routine, and the only material difference is the repeated 8235h callback.
+
+
+1F45 -> 0838 : runtime/cooperative AT24C02 random single-byte read
+-------------------------------------------------------------------
+Purpose:
+  Reads one addressed byte from the external AT24C02 serial EEPROM while
+  periodically yielding to the external application's fixed service hook at
+  8235h.
+
+  Functionally this is the cooperative/runtime counterpart of:
+
+      1F1B -> 071A
+
+  The resulting EEPROM byte is stored in FE2A.
+
+EEPROM/bus interface:
+  P0.1 = SCL
+  P3.6 = SDA
+
+Inputs:
+  FE29 = 8-bit AT24C02 word address to read
+
+No register input is required.
+
+High-level transaction:
+
+  START
+  send A0h                    ; WRITE phase
+  ACK-poll until accepted
+  send FE29                   ; target EEPROM word address
+
+  repeated START
+  send A1h                    ; READ phase
+
+  read one byte
+  FE2A = received byte
+  send NACK                   ; terminate one-byte read
+  STOP
+
+Calls to 8235h are inserted throughout that sequence.
+
+Setup helper 0853h performs:
+
+  CALL 8235
+  START
+  send A0h
+  if NACK: retry from 0853h
+
+  CALL 8235
+  send FE29
+
+  CALL 8235
+  repeated START
+
+  CALL 8235
+  send A1h
+  RET
+
+Top-level 0838h then performs:
+
+  CALL 0853
+  CALL 8235
+  CALL 0813                 ; receive one serial byte into A
+  FE2A = A
+  CALL 8235
+  CALL 07C6                 ; send NACK / terminate single-byte read
+  CALL 8235
+  CALL 07A9                 ; STOP
+  CALL 8235
+  RET
+
+Defined output:
+  FE2A = EEPROM byte read from address FE29
+
+  FE29 is not intentionally modified.
+
+Register return:
+  A is NOT a defined output of 1F45 even though the byte initially arrives in
+  A, because FE2A is stored before several subsequent 8235h calls.  Use FE2A
+  as the stable result.
+
+  CY is not a defined status output.
+
+Register/clobber notes:
+  As with 1F42, the external 8235h application callback prevents a meaningful
+  mask-ROM guarantee for transient GP-register/PSW results.  FE2A is the
+  deliberately persistent return channel.
+
+Hardware effects:
+  Generates an AT24C02 random-read transaction with repeated START and a final
+  NACK/STOP on P0.1/P3.6.
+
+Known TK-840 firmware 8355 callers:
+  A889h
+  B10Ah
+  B126h
+  B12Fh
+  B174h
+  E2BFh
+  E2CBh
+
+  (CPU addresses.)
+
+Usage note for custom firmware:
+  Address 8235h must contain a valid callable application-service routine if
+  1F45 is used.  If no yielding is wanted, 1F1B provides the simpler resident
+  random-read service without this external callback dependency.
+
+Confidence:
+  VERY HIGH.  The sequence is byte-for-byte recognizable as an AT24C02 random
+  read and mirrors the previously decoded resident 1F1B transaction with only
+  the external 8235h service calls added.
+
+
+1F48 -> 1129 : generic 64-byte AT29C256 flash-page writer
+----------------------------------------------------------------
+Purpose:
+  Programs exactly one 64-byte page of the external AT29C256 Flash using an
+  arbitrary caller-supplied source pointer and destination pointer.
+
+  This is the general resident flash-programming API.  It is the same low-level
+  64-byte programming mechanism used by the firmware loader and by codeplug
+  programming, exposed through a stable trampoline entry.
+
+Inputs:
+  DE = destination CPU address in the AT29C256
+  HL = source address of 64 bytes to program
+
+Required caller conditions:
+  DE should identify the start of a 64-byte AT29C256 page.
+
+  All 64 destination writes must remain within the same physical flash page.
+  Existing firmware callers use naturally aligned destinations such as E600h
+  and buffers such as FE40h/FE80h.
+
+Operation:
+
+  P3.7 = 0
+
+  CALL 1F3F                  ; AA @ D555
+                              ; 55 @ AAAA
+                              ; A0 @ D555
+
+  C = 40h
+  MOVBK [DE+],[HL+]          ; exactly 64 bytes
+
+  P3.7 = 1
+
+  CALL 1138h                 ; fixed Timer-1 completion delay
+  RET
+
+Defined memory/hardware result:
+  64 bytes beginning at the original DE destination have been loaded into one
+  AT29C256 programming page and the routine has waited for its fixed completion
+  interval.
+
+Pointer/register outputs:
+  DE = original DE + 0040h
+  HL = original HL + 0040h
+  C  = 00h after the 64-byte MOVBK completes
+  A  = A0h as a consequence of the 1F3F program-prefix routine
+
+No success/failure status:
+  The routine does not read back or verify the page and does not return a
+  documented CY/error result.  Completion is based on the resident Timer-1
+  delay routine at 1138h rather than software data polling.
+
+Other side effects:
+  P3.7 is driven low during the page-load sequence and returned high afterward.
+
+  Timer-1 configuration/status SFRs are modified by the completion delay.
+
+Flash command translation:
+  Because the AT29C256 is mapped at CPU address 8000h:
+
+    chip 5555h -> CPU D555h
+    chip 2AAAh -> CPU AAAAh
+
+  Therefore the 1F3F prefix used here is exactly the AT29C256 protected-page
+  sequence:
+
+    AA @ 5555
+    55 @ 2AAA
+    A0 @ 5555
+    then 64 page bytes
+
+Known TK-840 firmware 8355 uses:
+
+  8173h  CALL 1F48
+    Writes one of the two 64-byte receive buffers (FE40/FE80) to a destination
+    held in FECE, used by the executable-firmware programming path.
+
+  96B8h  CALL 1F48
+    Repeatedly writes an FF-filled 64-byte RAM buffer beginning at E600h and
+    advances through the codeplug region.
+
+  9F2Fh  BR 1F48
+    Tail-call use after application-specific setup.
+
+Important distinction from 1F36:
+  1F36 is a fixed-parameter wrapper:
+
+    source      FE40h
+    destination E680h
+    length      64
+
+  1F48 is the fully generic service where the caller supplies DE and HL.
+
+Usage caution:
+  This routine can program executable Flash as well as codeplug Flash.  Unlike
+  the serial PROGRAM-mode W command, it contains no E600h lower-bound guard.
+  The caller is responsible for supplying a safe destination.
+
+Confidence:
+  VERY HIGH.  Every instruction is accounted for, multiple live 8355 callers
+  establish the DE/HL calling convention, and the AT29C256 command sequence and
+  64-byte page size match the device documentation exactly.
+
+
+1F4B -> 1089 : build radio model-identification field
+-------------------------------------------------------
+Purpose:
+  Converts the hardware-family/RF-split flags established by 1F15 into the
+  six-character model-identification field used by the resident PROGRAM and
+  CLONE modes.
+
+Inputs:
+  No register arguments.
+
+  Resident hardware-identification flags:
+
+    FED3.4
+    FEDA.0
+    FEDF.4
+
+  These are produced by the 1F15 AN3/AN2 hardware-strap decoder.
+
+Output buffer:
+  FEC0-FEC5 = six ASCII bytes stored in REVERSE textual order.
+
+The resulting mappings are:
+
+  FED3.4  FEDA.0  FEDF.4   FEC0-FEC5 ASCII   Normal displayed order
+  ------  ------  -------  ----------------  ----------------------
+     1       1       x     "1B049M"          "M940B1"
+     1       0       x     "1B149M"          "M941B1"
+     0       0       0     "1B098M"          "M890B1"
+     0       0       1     "2B098M"          "M890B2"
+     0       1       0     "3B098M"          "M890B3"
+
+  x = FEDF.4 is ignored on the FED3.4=1 family path.
+
+Why the bytes are reversed:
+  The surrounding resident identification-response code consumes this field in
+  the opposite direction, producing the familiar on-wire model IDs such as:
+
+    M940B1
+    M941B1
+    M890B1
+    M890B2
+    M890B3
+
+Invalid/unclassified combination:
+  When FED3.4=0, FEDA.0=1 and FEDF.4=1, routine 1089h performs no FEC0-FEC5
+  write.  In that impossible/unsupported strap combination, the previous
+  contents of the six-byte buffer remain unchanged.
+
+Defined result:
+  FEC0-FEC5 contains the reverse-order six-byte model identification for every
+  valid hardware-strap combination.
+
+Register effects:
+  No general register is intentionally used as an argument or result.  The
+  implementation consists of bit tests, immediate stores to FEC0-FEC5 and RET.
+
+Known mask-ROM callers:
+  0D7Ch  resident PROGRAM-mode initialization
+  11D5h  resident CLONE-mode initialization
+
+No direct CALL 1F4B was found in TK-840 external firmware 8355.
+
+Relationship to 1F15:
+  1F15 is the hardware detector; 1F4B is the string encoder.
+
+  Together they explain why the common mask ROM contains explicit support for
+  both 800/900-MHz radios and the three UHF RF splits.  The same resident code
+  can identify different family members from hardware straps and construct the
+  correct programming/clone identification response.
+
+Confidence:
+  VERY HIGH.  Every valid branch writes a literal six-byte ASCII model field,
+  the reverse strings exactly match the known Kenwood programming IDs, and the
+  input bits are the ones set by the already-decoded 1F15 strap routine.
+
+
+Completeness assessment
+-----------------------
+All four valid 1F4x trampoline entries have now been traced through their full
+resident implementations and their external dependencies/calling conventions
+have been resolved:
+
+  1F42: exact EEPROM write parameters and transaction known; 8235 hook exposed.
+  1F45: exact EEPROM read parameter/result and transaction known; 8235 hook exposed.
+  1F48: exact DE/HL page-writer ABI, pointer results and flash sequence known.
+  1F4B: exact hardware-flag inputs and every valid model-string output known.
+
+No 1F4x entry remains unidentified.
+
+This completes the entire resident trampoline table from 1F00 through 1F4B.
+
+
+Cross-checks used
+-----------------
+- Actual 0000-1FFF mask-ROM dump and 8000-FDFF external-flash dump listed above.
+
+- Previously decoded resident EEPROM primitives:
+    0791 START
+    07A9 STOP
+    07C6 NACK/receive termination
+    07E6 transmit byte / sample ACK
+    0813 receive byte
+
+- AT24C02 protocol documentation:
+    A0h/A1h device address for address pins 000;
+    8-bit word address;
+    repeated-START random-read transaction.
+
+- Atmel AT29C256 documentation:
+    64-byte page programming;
+    protected-program AA/55/A0 sequence.
+
+- Kenwood TK-840 service documentation:
+    external EEPROM is AT24C02-family;
+    main CPU is uPD78312AGF3563BE.

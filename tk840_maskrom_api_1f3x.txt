@@ -1,0 +1,595 @@
+Kenwood TK-840 / uPD78312AGF3563BE
+Mask-ROM resident API: 1F3x trampoline entries
+=================================================
+
+Source dump SHA-256:
+  0000-1fff.bin  0572a52ad964ff67afc25feb0dbde5e7ad279cc5d00c47cc5ba1f9b2ae242543
+
+Companion external-flash dump used to identify callers/vector wrappers:
+  8000-fdff.bin  f5990f3454d7c6044ab83a6e2dd81df20cf99c57e495bc61e10d74d95bb1aacd
+
+Scope
+-----
+This file documents every valid trampoline entry in 0x1F30-0x1F3F.
+The table is composed of 3-byte absolute branches:
+
+  1F30 -> 17A3
+  1F33 -> 1726
+  1F36 -> 1113
+  1F39 -> 118D
+  1F3C -> 1161
+  1F3F -> 114E
+
+There are no additional trampoline entry points between these addresses.
+
+IMPORTANT CALLING-CONVENTION DISTINCTION
+----------------------------------------
+1F30 and 1F33 are INTERRUPT HANDLER entry points.  Their implementations end
+with RETI, not RET.  They are suitable as interrupt-vector branch targets but
+must NOT be invoked with an ordinary CALL instruction.
+
+1F39 is also not a normal returning subroutine.  It is a complete top-level
+CLONE-mode program and does not return to its caller.  Enter it with BR/jump,
+not CALL, unless the caller deliberately intends never to regain control.
+
+1F36, 1F3C and 1F3F are conventional returning service routines.
+
+Register-bank note
+------------------
+The uPD78312 maps its general-register banks into internal RAM.  With RBS=0,
+FEFC/FEFD are the E/D bytes of DE.  The 1F36 implementation writes FEFC as a
+word in order to load DE with E680h, so 1F36 assumes the normal resident/API
+execution environment with register bank 0 selected.  The known 8355 caller
+uses that environment.
+
+Flash address translation
+-------------------------
+The AT29C256 is mapped at CPU address 8000h.  Therefore the AT29C256 command
+addresses appear to the CPU as:
+
+  chip 5555h -> CPU D555h
+  chip 2AAAh -> CPU AAAAh
+
+This exactly matches the command writes used by 1F3C and 1F3F.
+
+
+Quick reference
+---------------
+
+Entry  Target  Function                                         Return/result
+-----  ------  -----------------------------------------------  -----------------------------
+1F30   17A3    INTE0/display-link start ISR                     RETI; serial frame initialized
+1F33   1726    CRF11 display-link bit/state ISR                 RETI; frame advanced/completed
+1F36   1113    Fixed 64-byte flash write FE40 -> E680           page E680-E6BF programmed
+1F39   118D    Standalone radio-to-radio CLONE-mode program     no normal return
+1F3C   1161    AT29C256 software-data-protection disable        SDP-disable sequence issued
+1F3F   114E    AT29C256 protected page-program command prefix   flash ready for 64-byte load
+
+
+1F30 -> 17A3 : INTE0 / display-serial start interrupt handler
+----------------------------------------------------------------
+Purpose:
+  Starts the resident serial exchange between the main uPD78312 and the
+  uPD75308 front-panel/display controller when INTE0 detects the panel's
+  start condition.
+
+  This is the interrupt-side companion to 1F2A.  1F2A can synthesize an
+  INTE0 request when the receive line is already low; 1F30 is the handler
+  that initializes the actual exchange.
+
+Vector use:
+  Internal/mask vector table:
+      0004h (INTE0) -> 17A3 directly
+
+  External/application vector table:
+      8004h -> 8097h wrapper
+      the wrapper normally BRanches to 1F30 when application-specific
+      interception conditions are not active.
+
+Inputs:
+  No register arguments.
+
+  Entry is expected in interrupt context.  Resident serial state and the
+  port/interrupt setup established by the normal initialization routines are
+  assumed to exist.
+
+Operation:
+
+  EI                              ; allow higher-priority nesting
+  EXIC0.6 = 1                     ; mask further INTE0 starts
+
+  if FED9.7 == 1:
+      RETI                        ; a panel frame is already active
+
+  P0.4 = 0                        ; assert main-CPU -> panel TX low/start
+  16-bit SFR FF1E = 0000h         ; initialize CRF11 timing/compare state
+  FED9.3 = 0                      ; clear frame-complete/phase state
+  FE27 = 09h                      ; initialize receive/bit count
+  CRIC11.7 = 0                    ; clear CRF11 interrupt request
+  CRIC11.6 = 0                    ; unmask CRF11 interrupt
+  FED9.7 = 1                      ; display serial frame active
+  FEDA.1 = 1                      ; display transfer busy
+  FED9.4 = 1                      ; select initial receive/sample phase
+  RETI
+
+Defined result:
+  The display-serial state machine is armed and CRF11 interrupts are enabled
+  to advance the frame.
+
+  There is no register return value and no CY status result.
+
+State/hardware effects:
+  EXIC0 is masked for additional start edges while the frame is active.
+  P0.4 is driven low at frame start.
+  FE27 is initialized to 9 timing/sample events.
+  FED9/FEDA serial-state flags are modified as listed above.
+  CRIC11 is cleared/unmasked so 1F33 can run.
+
+Already-active case:
+  If FED9.7 was already set, the routine still masks EXIC0 before returning,
+  but does not restart or overwrite the active frame state.
+
+Register preservation:
+  The routine body uses no general-purpose data register as an API operand or
+  result.  It terminates with RETI, restoring the interrupted PC/PSW context.
+
+Do NOT CALL it:
+  An ordinary CALL 1F30 is invalid because the endpoint is RETI.  Use it only
+  as an interrupt-vector branch target or when deliberately constructing the
+  exact interrupt stack/context expected by RETI.
+
+Confidence:
+  VERY HIGH.  The uPD78312 vector table identifies 0004h as INTE0, Kenwood
+  identifies P2.1/INTE0 as the panel serial input, and the entire serial state
+  initialized here is consumed by the fully decoded 1F33 state machine.
+
+
+1F33 -> 1726 : CRF11 display-serial timing/state-machine ISR
+----------------------------------------------------------------
+Purpose:
+  Advances the resident main-CPU <-> front-panel serial exchange one timing
+  phase at a time.  It alternates output-bit shifting and input-bit sampling,
+  handles turnaround/end-of-frame timing, posts a received byte, clears the
+  busy state, and re-enables INTE0 for the next panel-initiated exchange.
+
+Vector use:
+  Internal/mask vector table:
+      0020h (CRF11) -> 1726 directly
+
+  External/application vector table:
+      8020h -> 8092h wrapper
+      the wrapper contains a BR 1F33 at 8094h.
+
+Inputs:
+  No ordinary register arguments.
+
+  The ISR consumes resident state initialized by 1F30/17A3:
+
+    FE25    outgoing shift byte
+    FE26    incoming shift byte
+    FE27    serial timing/bit counter
+    FED9.3  data-bit phase complete flag
+    FED9.4  alternating TX/RX phase selector
+    FED9.5  turnaround/high-time phase flag
+    FED9.6  final turnaround phase flag
+    FED9.7  frame-active flag
+    FEDA.1  transfer-busy flag
+    FEDA.2  primary received-byte-pending flag
+
+  Hardware:
+    P0.4 = main CPU -> display-controller serial output
+    P2.1 = display-controller -> main CPU serial input
+
+Entry protection:
+  The ISR executes EI and selects register bank 1 (RBS0=1).  This gives the
+  interrupt state machine private general registers while RETI restores the
+  interrupted PSW/register-bank selection afterward.
+
+Main data phase:
+  While FED9.3 == 0, the handler alternates two sub-phases:
+
+  TX phase, when FED9.4 == 0:
+      A = FE25
+      rotate right through CY
+      P0.4 = CY                    ; transmit old FE25 bit 0
+      FE25 = shifted A
+      FED9.4 = 1
+
+    Thus outgoing data is shifted LSB-first.
+
+  RX phase, when FED9.4 == 1:
+      CY = P2.1
+      A = FE26
+      rotate right through CY
+      FE26 = A                     ; sample one incoming serial bit
+      FED9.4 = 0
+      FE27--
+
+      when FE27 reaches zero:
+          FED9.3 = 1               ; leave data phase
+          FE27 = 04h
+          FED9.5 = 0
+          EXIC0.7 = 0              ; clear stale external-start request
+
+Turnaround/end phase:
+  Once FED9.3 is set:
+
+  Phase 1, while FED9.5 == 0:
+      P0.4 = 1                     ; release/idle-high TX
+      FE27--
+      when FE27 == 0:
+          FED9.5 = 1
+          FED9.6 = 0
+
+  Phase 2:
+      if FED9.6 == 0:
+          FED9.6 = 1
+          RETI
+
+  Final completion:
+      CRIC11.6 = 1                 ; mask CRF11 timing interrupt
+      FE25 = FFh                   ; reset outgoing shift state
+      EXIC0.6 = 0                  ; re-enable panel start interrupt
+
+      if FE26 != FFh:
+          if FEDA.2 == 0:
+              FE2C = FE26
+              FEDA.2 = 1           ; primary received byte pending
+          else:
+              enqueue FE26 into resident overflow slots FEBC/FEBd/FEBE
+              using FEDD.0/.1/.2 as occupancy flags
+
+      FEDA.1 = 0                   ; transfer no longer busy
+      FED9.7 = 0                   ; frame no longer active
+      RETI
+
+Defined result:
+  No synchronous register return value.
+
+  On completion, one received non-FF byte is posted to FE2C/FEDA.2 or, when
+  that primary slot is already occupied, to the resident backup receive
+  slots.  FFh is treated as idle/no received data and is not posted.
+
+  FEDA.1 clearing is the completion event observed by 1F2D before another
+  outgoing panel byte can be queued.
+
+Register / context effects:
+  The handler deliberately switches to register bank 1, so its A/CY scratch
+  activity does not clobber the interrupted application's bank-0 registers.
+  RETI restores the interrupted PSW and register-bank selection.
+
+Do NOT CALL it:
+  This is a RETI endpoint and is valid as a CRF11 vector branch target, not as
+  an ordinary CALL/RET subroutine.
+
+Confidence:
+  VERY HIGH.  Every state transition is explicit and agrees with the already
+  decoded 1F2A/1F2D API behavior and Kenwood's documented panel serial pins.
+
+
+1F36 -> 1113 : fixed 64-byte AT29C256 write, FE40-FE7F -> E680-E6BF
+----------------------------------------------------------------------------
+Purpose:
+  Programs exactly one 64-byte AT29C256 page at CPU address E680h using the
+  64-byte resident RAM buffer at FE40h-FE7Fh.
+
+  Unlike 1F48, which is the generic DE/HL page writer, 1F36 hard-codes both
+  the destination page and source buffer.
+
+Inputs:
+  FE40h-FE7Fh = the 64 bytes to program
+  RBS = 0     = required normal API register-bank environment
+
+  No ordinary register argument is required.
+
+Operation:
+
+  DE = E680h                  ; loaded through bank-0 DE backing store FEFC
+  HL = FE40h
+  P3.7 = 0
+  CALL 1F3F                  ; AA@D555, 55@AAAA, A0@D555
+  C = 40h
+  MOVBK [DE+],[HL+]           ; load/program all 64 bytes
+  P3.7 = 1
+  CALL 1138h                  ; fixed Timer-1 completion delay/wait
+  RET
+
+Defined result:
+  AT29C256 CPU addresses E680h-E6BFh contain the 64 bytes previously present
+  at FE40h-FE7Fh, assuming a successful flash program cycle.
+
+Register effects on the known bank-0 calling convention:
+  DE = E6C0h                  ; advanced by 64 bytes
+  HL = FE80h                  ; advanced by 64 bytes
+  C  = 00h                   ; MOVBK count exhausted
+  A  = A0h                   ; left by 1F3F; delay does not redefine it
+  CY/other arithmetic flags are not an API status result.
+
+Hardware/SFR effects:
+  P3.7 is returned high.
+  Timer 1 is reconfigured temporarily by 1138h for the flash-write wait.
+  TMIC1 request state is cleared by that wait routine.
+
+Known caller in TK-840 firmware 8355:
+  E376h (external-flash CPU address; file offset 6376h)
+
+  The caller first:
+    - verifies a set of records beginning at E680h,
+    - fills FE40h-FE7Fh with FFh,
+    - overlays the first 28h bytes from one of several ROM templates,
+    - CALLs 1F36,
+    - then reinitializes RAM, GPIO and interrupt state.
+
+  This strongly identifies 1F36 as a resident fixed-page initialization/update
+  helper for the E680h codeplug/configuration page, not the general executable
+  firmware writer.
+
+Relationship to 1F48:
+  1F36 and 1F48 use the same low-level page-program sequence and the same
+  40h-byte MOVBK transfer.  1F36 fixes source/destination internally; 1F48
+  accepts the caller's DE destination and HL source.
+
+Failure/status behavior:
+  There is no explicit program-verify return code.  The routine waits a fixed
+  Timer-1 interval and returns.  Callers that require verification must read
+  the flash afterward.
+
+Confidence:
+  VERY HIGH.  Source, destination, page length, unlock routine and the live
+  8355 caller are all explicit.
+
+
+1F39 -> 118D : complete resident CLONE-mode program entry
+----------------------------------------------------------
+Purpose:
+  Enters Kenwood's standalone radio-to-radio CLONE mode implemented entirely
+  in the mask ROM.  This is a top-level operating mode, not a normal utility
+  subroutine.
+
+How it is selected:
+  The external firmware's startup/mode dispatch table contains:
+
+      8080 -> A891
+      8083 -> 9D41
+      8086 -> B3C9
+      8089 -> 1F39
+
+  Thus the selector corresponding to the fourth table entry transfers control
+  directly into this resident clone program.
+
+Inputs:
+  No register or RAM arguments.
+
+  The routine takes ownership of the CPU and initializes the machine from
+  scratch, so pre-existing application register/RAM state is intentionally
+  irrelevant.
+
+Entry/initialization sequence:
+  DI
+  service/configure watchdog
+  CCW.TPF = 0                  ; force interrupt vectors back to mask ROM
+  SP = FE20h
+  initialize CPU/peripherals
+  initialize ports
+  clear resident work RAM
+  initialize interrupts
+  initialize output-expander state
+  initialize display/front-panel link
+  detect model/RF split
+  configure timer/external-interrupt resources
+  EI
+
+Front-panel indication:
+  It sends display-control byte 8Eh and then the eight-character resident
+  string at 1E7Ch:
+
+      " CLONE  "
+
+  That independently identifies the operating mode.
+
+Main function:
+  The program implements radio-to-radio clone transfer of the normal codeplug
+  region E600h-FDFFh.  It contains both the serial/bit-level transport and the
+  user-interface/error handling needed for clone operation.
+
+  In the transmit path visible at 1317h it starts at HL=E600h and emits
+  repeated records consisting of:
+
+      'W'
+      address high/low
+      length 80h
+      128 data bytes from [HL++]
+
+  until HL reaches FE00h, i.e. after the complete E600h-FDFFh codeplug.
+
+  It also computes the 16-bit additive codeplug checksum over E600h-FDFFh at
+  14B6h and displays/uses it during clone operation.
+
+  Resident display strings used by this mode include " CLONE  ", " ERROR  "
+  and " END    ".
+
+Defined result:
+  NONE.  There is no normal RET path back to the application.
+
+  Successful or failed clone operation remains inside the resident mode/UI;
+  some terminal/error paths intentionally loop while servicing the watchdog.
+  Returning to normal application operation therefore requires the mode's
+  own restart/power-cycle path rather than a subroutine return.
+
+Register/memory effects:
+  Essentially unrestricted: this routine resets the stack, clears the normal
+  resident RAM work area, reprograms peripheral/interrupt configuration and
+  owns the machine until CLONE mode ends.
+
+How custom firmware should use it:
+  Treat 1F39 as a firmware-provided complete application mode.  If desired,
+  BR/JMP 1F39 and do not expect control back.  Do not CALL it as a conventional
+  library function.
+
+Not the firmware updater:
+  This entry is specifically radio-to-radio CODEPLUG clone mode.  The separate
+  mask-ROM firmware loader discussed elsewhere programs 8000h-E5FFh and is a
+  different top-level path.
+
+Confidence:
+  VERY HIGH.  The mode-dispatch branch, complete hardware reinitialization,
+  literal " CLONE  " display string, E600h-FDFFh transfer loop, checksum code,
+  and lack of a return path all agree.
+
+
+1F3C -> 1161 : AT29C256 software-data-protection disable sequence
+------------------------------------------------------------------
+Purpose:
+  Issues the AT29C256 software-data-protection (SDP) disable command sequence
+  at the CPU-mapped flash addresses, then waits a fixed Timer-1 interval.
+
+Inputs:
+  No register arguments.
+
+Operation:
+
+  P3.7 = 0
+
+  A = AAh ; [D555h] = A       ; chip address 5555h
+  A = 55h ; [AAAAh] = A       ; chip address 2AAAh
+  A = 80h ; [D555h] = A
+  A = AAh ; [D555h] = A
+  A = 55h ; [AAAAh] = A
+  A = 20h ; [D555h] = A
+
+  P3.7 = 1
+  CALL 1138h                   ; Timer-1 wait
+  RET
+
+The byte/address sequence exactly matches the AT29C256 documented SDP-disable
+algorithm:
+
+  AA @ 5555
+  55 @ 2AAA
+  80 @ 5555
+  AA @ 5555
+  55 @ 2AAA
+  20 @ 5555
+
+Defined result:
+  The AT29C256 has received its software-data-protection disable command
+  sequence.  No software status byte or CY result is returned.
+
+Register effects:
+  A = 20h on return
+  Other general registers are not used by 1161h itself.
+  Timer-1 SFRs are modified by the completion wait at 1138h.
+
+Hardware effects:
+  P3.7 is driven low during the command sequence and returned high.
+
+Usage caution:
+  This routine affects the flash device's protection state globally.  It is
+  not needed for ordinary protected page writes, because 1F3F supplies the
+  AA/55/A0 protected-program prefix used before each 64-byte page load.
+
+Known callers:
+  No direct CALL 1F3C/1161 was found in TK-840 external firmware 8355 or in
+  the normal mask-ROM paths outside the trampoline table.  Its presence in
+  the stable resident API is therefore plausibly for service/manufacturing,
+  another firmware revision, or another model sharing this mask ROM.
+
+Confidence:
+  VERY HIGH.  The sequence is literal and exactly matches the AT29C256 SDP
+  disable algorithm.
+
+
+1F3F -> 114E : AT29C256 protected page-program command prefix
+----------------------------------------------------------------
+Purpose:
+  Places the AT29C256 into its software-protected page-program data-load state.
+  The caller must immediately follow this routine by writing exactly 64 bytes
+  to one flash page.
+
+Inputs:
+  No register arguments.
+
+Operation:
+
+  A = AAh ; [D555h] = A       ; chip 5555h
+  A = 55h ; [AAAAh] = A       ; chip 2AAAh
+  A = A0h ; [D555h] = A       ; chip 5555h
+  RET
+
+This is the AT29C256 documented protected-program prefix:
+
+  AA @ 5555
+  55 @ 2AAA
+  A0 @ 5555
+  then load 64 data bytes into the selected page
+
+Defined result:
+  The flash is waiting for the caller's 64-byte page-data load.
+
+Register effects:
+  A = A0h on return
+  No other general register is touched by this routine.
+  CY is not a status result.
+
+No completion wait:
+  1F3F does NOT wait for a program cycle because no page data has yet been
+  supplied.  The caller performs the 64-byte load and then invokes/executes
+  the resident Timer-1 wait logic.
+
+Known mask-ROM users:
+  0372h
+  03A6h
+  0465h
+  0F46h
+  111Ch (inside 1F36)
+  112Bh (inside generic 1F48 writer)
+
+These include the firmware-loader, normal codeplug-write and resident API
+flash-programming paths, showing that 1F3F is the common low-level flash
+program-enable primitive shared by all of them.
+
+Usage caution:
+  Calling 1F3F without immediately supplying a valid 64-byte same-page data
+  load is not a meaningful standalone operation and can leave the flash in an
+  incomplete command/data-load sequence.
+
+Confidence:
+  VERY HIGH.  The three literal command writes are the exact AT29C256
+  protected page-program prefix and all resident flash writers converge here.
+
+
+Completeness assessment
+-----------------------
+All six valid 1F3x trampoline entries have now been traced to their complete
+resident implementations and their external use/entry semantics have been
+resolved:
+
+  1F30: exact INTE0 display-start ISR state changes known.
+  1F33: complete display serial bit/state ISR known through frame completion.
+  1F36: exact fixed source, destination, size, flash sequence and live caller known.
+  1F39: positively identified as standalone CLONE mode; initialization,
+        codeplug range, transfer role and non-returning behavior known.
+  1F3C: exact AT29C256 SDP-disable command sequence and side effects known.
+  1F3F: exact AT29C256 protected-program prefix and caller contract known.
+
+No 1F3x entry remains unidentified.
+
+
+Cross-checks used
+-----------------
+- Actual 0000-1FFF mask-ROM dump and 8000-FDFF external-flash dump listed above.
+
+- NEC uPD78312A architecture/vector documentation:
+    vector 0004h = INTE0;
+    vector 0020h = CRF11;
+    general register banks are mapped in internal RAM;
+    RETI restores interrupt context/PSW.
+
+- Kenwood TK-840 service documentation:
+    P0.4/P2.1 are the main-CPU/front-panel serial TX/RX signals;
+    the external nonvolatile program/configuration device is an AT29C256.
+
+- Atmel AT29C256 documentation:
+    64-byte page programming;
+    protected-program AA/55/A0 sequence;
+    software-data-protection disable AA/55/80/AA/55/20 sequence.

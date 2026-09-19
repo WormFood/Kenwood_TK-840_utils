@@ -1,0 +1,605 @@
+Kenwood TK-840 / uPD78312AGF3563BE
+Mask-ROM resident API: 1F2x trampoline entries
+=================================================
+
+Source dump SHA-256:
+  0000-1fff.bin  0572a52ad964ff67afc25feb0dbde5e7ad279cc5d00c47cc5ba1f9b2ae242543
+
+Companion external-flash dump used to identify callers:
+  8000-fdff.bin  f5990f3454d7c6044ab83a6e2dd81df20cf99c57e495bc61e10d74d95bb1aacd
+
+Scope
+-----
+This file documents every valid trampoline entry in 0x1F20-0x1F2F.
+The table itself is made of 3-byte absolute branches, so the valid entries in
+this range are:
+
+  1F21 -> 0729
+  1F24 -> 06BE
+  1F27 -> 06F4
+  1F2A -> 170A
+  1F2D -> 1714
+
+There are no trampoline entries at the intervening addresses; they fall inside
+one of the three-byte entries above.
+
+Each entry is a BR !target trampoline.  Application firmware can CALL the
+stable 1Fxx address, the trampoline branches into the resident implementation,
+and the implementation's RET returns directly to the application caller.
+
+Important short-direct-address note
+-----------------------------------
+As in the 1F1x analysis, the local disassembler prints short-direct addresses
+00h-1Fh as FE00h-FE1Fh.  On the uPD78312 they select SFRs FF00h-FF1Fh.
+The hardware names below use the corrected interpretation:
+
+  short 00h = P0
+  short 02h = P2
+
+Relevant TK-840 CPU pins from the Kenwood service manual:
+
+  P0.7  D/A-converter enable / M62363 LD
+  P0.1  shared PLL / EEPROM / shift-register / D-A clock
+  P0.2  shared PLL / shift-register / D-A serial data
+  P0.3  shift-register enable/strobe
+  P0.4  display serial TX data output
+  P2.1  INTE0 / display serial RX data input
+
+
+Quick reference
+---------------
+
+Entry  Target  Function                                      Defined result
+-----  ------  --------------------------------------------  -----------------------------
+1F21   0729    AT24C02 sequential multi-byte read            [HL...] filled; HL advanced
+1F24   06BE    M62363FP 8-channel DAC write                  selected DAC output updated
+1F27   06F4    BU4094/XRU4094 output-expander update         FE28 latched to Q1-Q8
+1F2A   170A    Display-RX missed-start / INTE0 kick helper   may pend INTE0 request
+1F2D   1714    Queue/start one display serial TX byte         asynchronous panel transfer
+
+
+1F21 -> 0729 : AT24C02 sequential multi-byte read
+--------------------------------------------------
+Purpose:
+  Reads B sequential bytes from the external AT24C02 serial EEPROM, beginning
+  at the 8-bit word address in FE29, and stores them beginning at [HL].
+
+  This is the multi-byte companion to 1F1B, which reads one byte into FE2A.
+
+Bus implementation:
+  P0.1 = SCL
+  P3.6 = SDA
+
+  The routine uses the same resident two-wire primitives documented for the
+  1F18/1F1B/1F1E EEPROM API:
+
+    0791  START
+    07A9  STOP
+    07C6  transmit NACK
+    07D6  transmit ACK
+    07E6  transmit one byte and receive slave ACK
+    0813  receive one byte
+
+Inputs:
+  FE29 = first EEPROM word address
+  HL   = destination-buffer pointer
+  B    = number of bytes to read
+
+  B must be nonzero.  The routine receives a byte before decrementing B, so
+  B=00h would wrap and act as a 256-byte request rather than a zero-length
+  read.  Treat B=0 as invalid for normal use.
+
+Transaction performed:
+
+  START
+  send A0h                   ; AT24C02 device address, WRITE
+  if NACK: restart/retry     ; indefinite ACK polling
+  send FE29                  ; set EEPROM word-address pointer
+
+  repeated START
+  send A1h                   ; AT24C02 device address, READ
+
+  repeat:
+      A = receive byte
+      [HL++] = A
+      B--
+      if B != 0:
+          send ACK
+      else:
+          send NACK
+  until B == 0
+
+  STOP
+  RET
+
+Outputs on successful completion:
+  destination buffer = B_original bytes read from EEPROM
+  HL = original HL + original B
+  B  = 0
+  A  = final byte received
+
+  FE29 is preserved.
+
+EEPROM address behavior:
+  The AT24C02 automatically increments its internal 8-bit address after each
+  received byte.  The ROM routine does not alter FE29 while the transfer is
+  occurring.  Reads that pass FFh therefore follow the EEPROM device's normal
+  address-wrap behavior.
+
+ACK handling:
+  - The initial A0h control byte is ACK-polled indefinitely.  This also waits
+    for completion of a preceding EEPROM write cycle.
+  - The ACK after FE29 is not explicitly tested.
+  - The ACK after the repeated-start A1h control byte is not explicitly tested.
+  - Every byte except the last is followed by a master ACK.
+  - The last byte is followed by a master NACK and then STOP.
+
+Register / state clobbers:
+  A  = final byte received
+  B  = 0
+  HL = advanced by the number of bytes requested
+  C  = scratch in the bit-level serial routines; ends at 0 after receive
+  CY = data-dependent / not a defined status result
+
+  DE and X are not part of this routine's data path.
+
+Known callers in TK-840 external firmware 8355:
+  BAF7  FE29=...; HL=FEAE; B=2
+  BB0F  FE29=F6; HL=FEAE; B=2
+  BB3C  FE29=EC; HL=FEAE; B=2
+  BD0A  FE29=F4; HL=FEAE; B=2
+  BD19  FE29=F6; HL=FEAE; B=2
+
+  These live callers independently confirm the FE29 / HL / B calling
+  convention.
+
+Confidence:
+  VERY HIGH.  The complete START/address/repeated-START/read/ACK/NACK/STOP
+  sequence is explicit, and every branch and callee is already decoded.
+
+
+1F24 -> 06BE : M62363FP 8-channel D/A-converter write
+-------------------------------------------------------
+Purpose:
+  Sends one complete 12-bit serial command to the M62363FP level-adjuster DAC
+  (TK-840 TX-RX unit IC6), selecting one of its eight outputs and loading an
+  8-bit DAC value.
+
+Hardware interface:
+  P0.7 = DAC LD / enable
+  P0.1 = DAC clock
+  P0.2 = DAC serial data
+
+  Kenwood identifies IC6 as an M62363FP level adjuster.  The M62363FP accepts
+  a 12-bit serial word consisting of a four-bit DAC selector followed by an
+  eight-bit DAC value.
+
+Inputs:
+  A = DAC channel selector, low nibble only
+  X = 8-bit DAC value
+
+  Equivalently, the useful input can be considered AX with:
+
+      A = 01h .. 08h
+      X = 00h .. FFh
+
+  The upper nibble of A is ignored by the shift loop.
+
+Channel-selector encoding:
+  The ROM sends A bit 0 first, then bits 1, 2 and 3.  This corresponds exactly
+  to the M62363FP's D11,D10,D9,D8 selector field and gives the natural mapping:
+
+      A low nibble   selected DAC
+      ------------   ------------
+          1              Ao1
+          2              Ao2
+          3              Ao3
+          4              Ao4
+          5              Ao5
+          6              Ao6
+          7              Ao7
+          8              Ao8
+
+  Selector 0 and 9-F are documented by the M62363FP as don't-care / no valid
+  output selection and should not be used as normal API arguments.
+
+Serial transfer performed:
+
+  P0.7 = 0                   ; LD low / begin shift
+
+  send selector field:
+      four clocks
+      transmit A bits 0,1,2,3 in that order
+
+  A = X
+
+  send DAC data field:
+      eight clocks
+      transmit X bits 7,6,5,4,3,2,1,0 in that order
+
+  P0.7 = 1                   ; latch/update selected DAC
+  P0.2 = 0
+  P0.1 = 0
+  RET
+
+Why the apparently mixed bit order is correct:
+  The M62363 serial frame is D11..D8 followed by D7..D0.  Its channel number
+  is naturally encoded across D8..D11, so sending A bit0 first produces D11
+  first.  The eight-bit DAC value is then sent conventionally MSB first.
+
+Defined hardware output:
+  The selected M62363 DAC latch is loaded with X and its analog output changes
+  accordingly.
+
+  Kenwood states that this DAC is used as a set of electronic semi-fixed
+  resistors for functions including reference-oscillator adjustment,
+  transmitter power, modulation level and audio-power level.  Which physical
+  adjustment is attached to a given DAC channel is board wiring, not part of
+  this routine's calling convention.
+
+Register / state effects:
+  X = preserved
+  A = 00h on return (X has been shifted left eight times)
+  C = 00h on return
+  CY = incidental final shift bit (original X bit 0); NOT a status result
+
+  B, DE and HL are not used.
+
+  P0.7 returns high.
+  P0.2 returns low.
+  P0.1 returns low.
+
+Known callers:
+  No direct CALL 1F24 and no direct CALL 06BE were found in the TK-840 8355
+  external firmware or in the resident mask-ROM code outside the trampoline.
+
+  The routine is nevertheless completely identifiable from its pin usage,
+  12-bit waveform, and the documented M62363FP protocol.  Its presence in the
+  stable 1Fxx table is consistent with a family-wide resident API service
+  used by another application revision/model or by code not present in the
+  particular 8355 image.
+
+Confidence:
+  VERY HIGH.  The entire routine is straight-line code with no callees, and
+  its exact 4+8-bit waveform matches the M62363FP protocol and Kenwood's CPU
+  pin assignments.
+
+
+1F27 -> 06F4 : BU4094/XRU4094 output-expander update
+-----------------------------------------------------
+Purpose:
+  Shifts the resident output-shadow byte FE28 into the external 8-bit
+  shift/store register used as the radio's output-port expander, then strobes
+  the new value into its parallel-output latch.
+
+Hardware:
+  Kenwood identifies the output expander as:
+
+      IC10 = XRU4094BCF or BU4094BCF
+
+  Relevant CPU pins:
+
+      P0.1 = clock
+      P0.2 = serial data
+      P0.3 = shift-register enable/strobe
+
+Inputs:
+  FE28 = complete 8-bit output-expander image
+
+  No general register is an API argument.
+
+Transfer performed:
+
+  A = FE28
+  C = 8
+
+  repeat 8 times:
+      shift A left; old bit7 -> CY
+      P0.2 = CY
+      P0.1 = 1
+      P0.1 = 0
+  until C == 0
+
+  P0.3 = 1                   ; strobe shift register into output latch
+  P0.3 = 0
+  P0.2 = 0
+  RET
+
+Bit ordering / parallel result:
+  FE28 bit 7 is the first serial bit and FE28 bit 0 is the last serial bit.
+  With a standard BU4094 shift/store register this leaves, after the strobe:
+
+      Q1 = FE28 bit 0
+      Q2 = FE28 bit 1
+      Q3 = FE28 bit 2
+      Q4 = FE28 bit 3
+      Q5 = FE28 bit 4
+      Q6 = FE28 bit 5
+      Q7 = FE28 bit 6
+      Q8 = FE28 bit 7
+
+  Thus FE28 is a conventional software shadow byte for Q1-Q8 despite the
+  MSB-first serial transfer.
+
+Outputs / side effects:
+  - All eight output-expander parallel outputs are replaced atomically when
+    P0.3 is strobed.
+  - FE28 itself is preserved.
+
+Register / state effects:
+  A = 00h on return
+  C = 00h on return
+  CY = incidental final shift bit (original FE28 bit 0), not a status result
+
+  B, X, DE and HL are not used by the routine.
+
+  P0.1 returns low.
+  P0.2 returns low.
+  P0.3 returns low.
+
+Known callers:
+  Mask ROM:
+    0067  after FE28 = 25h during normal resident startup
+    0D56  after FE28 = 25h in another resident startup path
+    11AF  after FE28 = 25h in firmware-loader startup
+
+  TK-840 external firmware 8355:
+    987F  after FE28 = A4h during application initialization
+
+Calling rule:
+  Treat FE28 as the authoritative output shadow.  Modify the desired bit(s) in
+  FE28 first, then CALL 1F27 to publish the entire byte.  Calling 1F27 with an
+  arbitrary FE28 value changes every expander output at once.
+
+Confidence:
+  VERY HIGH.  The straight-line eight-bit shift plus strobe is unambiguous,
+  Kenwood identifies P0.1/P0.2/P0.3 as the shift-register interface, and the
+  service manual identifies IC10 as the 4094 output expander.
+
+
+1F2A -> 170A : display-serial RX missed-start / INTE0 kick helper
+-----------------------------------------------------------------
+Purpose:
+  Checks the display-controller serial receive line and, when necessary,
+  synthesizes an INTE0 interrupt request so the resident display-serial state
+  machine starts even if the physical falling edge was missed while the
+  interrupt was masked or while software was polling.
+
+Relevant hardware / state:
+  P2.1 / INTE0 = display serial RX input from the LCD/front-panel CPU
+  EXIC0.7      = INTE0 interrupt-request flag
+  FED9.7       = resident display-serial transfer-active flag
+
+Inputs:
+  No register arguments.
+
+Operation:
+
+  if FED9.7 == 1:
+      RET                       ; a panel serial transfer is already active
+
+  if P2.1 == 1:
+      RET                       ; RX line is idle/high, no start condition
+
+  EXIC0.7 = 1                   ; pend/synthesize INTE0 request
+  RET
+
+Defined result:
+  No register or RAM value is returned.
+
+  The only possible intentional side effect is setting EXIC0.7.  If INTE0 is
+  unmasked and global interrupts are enabled, that request transfers control
+  into the resident display-serial start ISR at 17A3, which initializes the
+  serial exchange state machine.
+
+Why this helper exists:
+  The display CPU can pull P2.1 low to initiate an exchange.  If software sees
+  the line already low, there may no longer be a new falling edge available
+  to trigger INTE0 naturally.  Setting the request flag causes the same ISR to
+  run as though the edge had just occurred.
+
+Register / state effects:
+  No general registers are modified by the routine body.
+  No data byte is consumed or returned.
+  Condition flags are not an API result.
+
+Known callers:
+  Mask ROM:
+    0184  while waiting for the display CPU during initial handshake
+    02A3  in the PROGRAM/firmware-loader display communication loop
+
+  No direct external-firmware 8355 CALL 1F2A was found.
+
+Confidence:
+  VERY HIGH.  The routine is only four logical operations, the service manual
+  explicitly identifies P2.1/INTE0 as display serial RX, and the uPD78312
+  interrupt-control definition identifies EXIC0.7 as the request flag.
+
+
+1F2D -> 1714 : queue/start one display-controller serial byte
+--------------------------------------------------------------
+Purpose:
+  Queues one byte for transmission from the main uPD78312 CPU to the
+  uPD75308-based LCD/front-panel controller and asserts the display-TX start
+  condition.  The actual serial bit shifting is completed asynchronously by
+  the resident interrupt-driven display-serial state machine.
+
+Relevant hardware / state:
+  P0.4   = display serial TX output from the main CPU
+  P2.1   = display serial RX input from the front-panel CPU
+  FE25   = resident outgoing shift byte
+  FEDA.1 = resident display-transfer busy flag
+
+Input:
+  A = byte to send to the LCD/front-panel CPU
+
+Entry behavior:
+  The routine first services the watchdog and waits until FEDA.1 clears:
+
+      WDM = 00h
+      WDM = 86h
+      while FEDA.1 == 1:
+          repeat
+
+  Therefore successive calls serialize themselves; a caller cannot overwrite
+  FE25 while the preceding panel byte is still in progress.
+
+Once idle:
+
+  FE25   = A
+  FEDA.1 = 1                   ; mark panel transfer busy
+  P0.4   = 0                   ; assert display-TX start/low condition
+  RET
+
+Important asynchronous behavior:
+  1F2D does NOT wait for the byte it just queued to finish.  It waits only for
+  the PREVIOUS transfer to become idle, starts the new transfer, and returns.
+
+  The resident serial interrupt machinery then shifts FE25 onto P0.4.  The
+  transmit data bits are sent LSB first.  At the same time P2.1 is sampled as
+  the return-data line from the display controller.
+
+  At completion the interrupt state machine clears FEDA.1, allowing the next
+  1F2D call to proceed.
+
+Receive side effect of the same exchange:
+  The panel link is effectively a bidirectional byte exchange.  The resident
+  ISR also assembles the byte received on P2.1 while the outgoing byte is
+  being shifted.
+
+  A received FFh is treated as idle/no-data.
+
+  A non-FFh byte is posted to the resident receive state.  The first pending
+  byte is placed in FE2C and FEDA.2 is set.  Additional bytes that arrive
+  before software consumes the first one can be held in the resident backup
+  slots FEBC/FEBd/FEBE under FEDD flag control.
+
+  These receive-queue details are side effects of the common serial ISR, not
+  direct return values from 1F2D.
+
+Defined return state:
+  A is copied into FE25 and is not otherwise altered by the 1F2D body.
+  There is no synchronous received-byte return value and no CY status result.
+
+  Because the actual transfer is interrupt-driven after the routine starts it,
+  callers should treat only the queued outgoing byte / busy-state transition
+  as the API result, not incidental CPU flags.
+
+Other register / hardware effects:
+  - B, C, X, DE and HL are not used by the 1F2D body.
+  - WDM is written with the normal watchdog-service sequence while waiting.
+  - P0.4 is driven low to initiate the exchange.
+  - FE25 is destructive resident state until the ISR has shifted the byte.
+  - FEDA.1 remains set until the interrupt state machine completes the frame.
+
+Known uses in the mask ROM:
+  1F2D is heavily used by the resident monitor/display code.
+
+  Examples:
+    0159  sends B0h during the initial front-panel handshake
+    0290  sends 82h in PROGRAM/loader mode
+    15C8  sends 02h followed by eight bytes from [HL++]
+    15EE  sends 02h followed by four bytes from [HL++]
+
+  The long runs of calls around 04D0-06BA send literal bytes/characters to the
+  display controller, confirming that A is the outgoing byte argument.
+
+External-firmware usage:
+  No direct CALL 1F2D appears in the TK-840 8355 application image and the
+  application's CALLT table does not point directly at 1F2D.  Application
+  code can nevertheless reach resident higher-level display helpers that use
+  1F2D internally.
+
+Failure / blocking behavior:
+  There is no timeout while waiting for FEDA.1 to clear.  If the resident
+  display state machine never completes a preceding transaction, a subsequent
+  CALL 1F2D can wait forever while continuing to service the watchdog.
+
+Confidence:
+  VERY HIGH.  The entry routine itself is trivial, all FE25/FEDA.1 references
+  are confined to the decoded serial state machine, Kenwood explicitly labels
+  P0.4/P2.1 as display serial TX/RX, and the higher-level resident callers show
+  literal and buffered display-byte transmission.
+
+
+Shared display-serial machinery relevant to 1F2A / 1F2D
+--------------------------------------------------------
+The following resident code establishes the meaning of the two API entries:
+
+  17A3  INTE0 display-RX start ISR
+        Masks the external start interrupt, initializes transfer state,
+        establishes a nine-step receive count, and starts the timed exchange.
+
+  1726  timed display-serial ISR/state machine
+        Alternates outgoing P0.4 shifts and incoming P2.1 samples, generates
+        the end-of-frame/idle state, posts received non-FF data, clears the
+        busy state, and re-enables INTE0 for the next panel-initiated frame.
+
+Important resident state:
+
+  FE25    outgoing panel shift byte
+  FE26    incoming panel shift byte
+  FE27    serial-state bit/time counter
+  FEDA.1  panel transfer busy
+  FEDA.2  received-byte pending
+  FED9.7  serial frame active
+  FE2C    primary received byte
+  FEBC-
+  FEBE    additional pending receive slots
+
+This machinery explains why 1F2D is a queue/start operation rather than a
+blocking polled UART putc, and why 1F2A exists to recover a low RX line whose
+falling edge may no longer be observable.
+
+
+Completeness assessment
+-----------------------
+All five valid 1F2x trampoline entries have now been traced through their
+complete implementations and, where relevant, through the subordinate state
+machines required to understand their external behavior.
+
+  1F21: complete transaction and register/pointer semantics known.
+  1F24: exact 12-bit DAC protocol and A/X calling convention known.
+  1F27: exact 8-bit shift-register protocol and FE28 shadow semantics known.
+  1F2A: exact conditions and INTE0-request side effect known.
+  1F2D: byte argument, busy behavior, start action, asynchronous completion,
+        and receive-side effects known.
+
+No unresolved indirect branch, unknown subroutine, or unknown argument is
+required to call any of these five routines correctly.
+
+One distinction is intentional rather than unresolved: the semantic purpose
+of every individual M62363 analog output and every individual 4094 expander
+output is board/model wiring rather than part of these routines' software
+calling conventions.  The exact serialized values and hardware destination
+are nevertheless fully determined.
+
+No 1F2x entry remains unidentified.
+
+
+Cross-checks used
+-----------------
+- Kenwood TK-840/(N) service manual:
+    uPD78312 pin functions;
+    P0.7 DAC enable;
+    P0.1 shared serial clock;
+    P0.2 shared serial data;
+    P0.3 shift-register enable;
+    P0.4/P2.1 display serial TX/RX;
+    IC6 = M62363FP level adjuster;
+    IC10 = XRU4094BCF or BU4094BCF output expander;
+    LCD CPU receives serial display data and sends switch data back.
+
+- Mitsubishi/Renesas M62363FP documentation:
+    8-channel 8-bit DAC;
+    12-bit serial frame;
+    D11-D8 DAC selector plus D7-D0 data;
+    selector codes 1-8.
+
+- ROHM BU4094BCF documentation:
+    8-bit serial shift register plus output latch/strobe.
+
+- NEC uPD78312/uPD78312A interrupt architecture:
+    P2.1 = INTE0;
+    EXIC0.7 = interrupt-request flag;
+    EXIC0.6 = interrupt mask/control bit.

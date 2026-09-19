@@ -1,0 +1,371 @@
+Kenwood TK-840 / uPD78312AGF3563BE
+Mask-ROM resident API: 1F0x trampoline entries
+=================================================
+
+Source dump SHA-256:
+  0000-1fff.bin  0572a52ad964ff67afc25feb0dbde5e7ad279cc5d00c47cc5ba1f9b2ae242543
+
+Scope
+-----
+This file documents every valid trampoline entry in 0x1F00-0x1F0F:
+
+  1F00 -> 0D34
+  1F03 -> 1604
+  1F06 -> 1675
+  1F09 -> 1666
+  1F0C -> 010C
+  1F0F -> 00ED
+
+Each trampoline is a 3-byte absolute branch (BR !target).  Application
+firmware can therefore CALL 1Fxx; the branch enters the resident routine,
+and a normal RET in that routine returns directly to the original caller.
+1F00 is the exception: its target is a non-returning monitor.
+
+Unless otherwise stated, these routines assume RSS=0 on entry.  The BCD
+routines use the 78K/III register-bank/RSS mechanism internally and restore
+RSS=0 before returning.
+
+
+Quick reference
+---------------
+
+Entry  Target  Function                              Defined result
+-----  ------  ------------------------------------  ----------------------------
+1F00   0D34    KPG programming-monitor entry         Does not return
+1F03   1604    16-bit unsigned binary -> 4-digit BCD [HL..HL+1], CY status
+1F06   1675    Signed 8-digit packed-BCD addition    Result -> [HL..HL+3]
+1F09   1666    Signed 8-digit packed-BCD subtraction Result -> [HL..HL+3]
+1F0C   010C    Clear resident working RAM            FE20-FEEF = 00
+1F0F   00ED    Baseline port/GPIO initialization     Port/SFR values listed below
+
+
+1F00 -> 0D34 : KPG programming monitor
+---------------------------------------
+Purpose:
+  Enters the mask-ROM PC programming monitor.  This is a complete monitor
+  entry, not a helper subroutine.
+
+Inputs:
+  No register or memory arguments.
+
+Output / return:
+  NONE.  This routine does not return to its caller.
+
+Major actions on entry:
+  - DI (interrupts disabled)
+  - services/reinitializes watchdog control
+  - clears CCW.1 / TPF, selecting the internal low-vector table
+  - sets SP = FE20
+  - performs baseline peripheral/port initialization
+  - calls 1F0F (port initialization)
+  - overrides PM1 with 1B for this mode
+  - calls 1F0C (clears FE20-FEEF working RAM)
+  - initializes interrupt/peripheral state
+  - enables interrupts
+  - sends the front-panel/display message "PROGRAM "
+  - enters the serial programming command loop
+
+Commands visible in the command dispatcher:
+  02h   identification transaction
+  03h   reads/sends a resident/external identification block
+  04h   receives/checks the 10-byte data at E670-related path
+  'R'   memory read transaction
+  'W'   memory write transaction
+  'E'   exit programming mode / arrange reset
+
+Important write protection:
+  The normal 'W' command checks the requested address against E600.
+  Addresses below E600 are rejected, so this normal programming monitor
+  cannot overwrite the executable flash area at 8000-E5FF.
+
+Calling notes:
+  Treat CALL 1F00 as noreturn.  It reinitializes substantial hardware and
+  clears working RAM, so there is no meaningful preserved caller context.
+
+Confidence:
+  HIGH.  Fully traced from 0D34 through the command dispatcher and exit path.
+
+
+1F03 -> 1604 : unsigned 16-bit binary to packed BCD
+---------------------------------------------------
+Identification:
+  This is Kenwood's copy/adaptation of NEC's published 78K/III THXBCD
+  ("transform BCD <- HEX") routine.
+
+Input:
+  HL = address of a 2-byte LITTLE-ENDIAN unsigned binary value.
+
+  [HL+0] = binary low byte
+  [HL+1] = binary high byte
+
+Valid input range:
+  0 through 9999 decimal (0000h through 270Fh).
+
+Success output:
+  CY = 0
+  The SAME two bytes are overwritten with four-digit packed BCD.
+
+  [HL+0] = tens:ones
+  [HL+1] = thousands:hundreds
+
+Example:
+  binary 1234 decimal = 04D2h
+
+  before:  D2 04
+  after:   34 12
+  CY = 0
+
+Error output:
+  If the binary input is >= 10000 (2710h):
+
+  CY = 1
+  [HL] and [HL+1] are NOT modified.
+
+Register / state notes:
+  - This is not a register-preserving function.  It uses AX, DE, HL, B,
+    alternate/RSS scratch registers, VP and UP while converting.
+  - RSS is restored to 0 before a normal return.
+  - On successful return HL has been advanced by the internal two-byte BCD
+    shift operation; callers should not rely on HL retaining the input pointer.
+  - The only interface outputs a caller should depend on are the two memory
+    bytes and CY.
+
+Confidence:
+  VERY HIGH.  The algorithm and calling convention match NEC's published
+  THXBCD routine essentially instruction-for-instruction.
+
+
+1F06 -> 1675 : signed 8-digit packed-BCD addition
+-------------------------------------------------
+Identification:
+  Kenwood's copy/adaptation of NEC's published BCDADD routine.
+
+Operation:
+  *HL = *HL + *DE
+
+Input:
+  HL = low address of 4-byte AUGEND / RESULT area
+  DE = low address of 4-byte ADDEND area
+
+Data format:
+  Signed packed BCD, eight digit positions in four bytes, least-significant
+  byte first.  Bit 7 of the most-significant byte is the sign bit:
+
+    bit 7 = 0 : positive
+    bit 7 = 1 : negative
+
+  The remaining bits/nibbles contain the absolute decimal magnitude.
+  Because the sign consumes bit 7, the valid numeric range is:
+
+    -79,999,999 through +79,999,999
+
+Example positive 12,345,678:
+  [base+0] = 78
+  [base+1] = 56
+  [base+2] = 34
+  [base+3] = 12
+
+Example negative 12,345,678:
+  [base+0] = 78
+  [base+1] = 56
+  [base+2] = 34
+  [base+3] = 92     (same magnitude, sign bit set)
+
+Output:
+  Four-byte signed packed-BCD result is written IN PLACE to:
+
+    [original HL+0 .. original HL+3]
+
+Operand side effects:
+  The HL/result area is necessarily overwritten.
+
+  The DE/addend area is NOT guaranteed to be preserved.  When the operand
+  signs differ, the subtraction path clears/manipulates the sign bit in the
+  most-significant source byte as part of converting the operation to an
+  absolute-value subtraction.  Treat [DE+3].bit7 as scratch/destructive.
+  The source magnitude digits are only read.
+
+Register / flag notes:
+  - Uses/clobbers A, B, C, DE, HL and scratch/status state.
+  - Uses PSWH.7 internally as the signed-decimal sign flag.
+  - Do not rely on DE or HL retaining their original pointer values.
+  - Input must already be valid packed BCD; this routine does not perform a
+    general validity check of every digit.
+
+Overflow behavior -- IMPORTANT:
+  NEC's reference routine branches to an ERROR handler if signed BCD overflow
+  occurs.  Kenwood replaced those ERROR branches with branches to 1709, which
+  is only a RET.
+
+  Therefore this ROM version DOES NOT provide a documented/reliable error
+  return flag for all overflow cases.  Do not use CY as a universal overflow
+  result.  If overflow is possible, range-check operands before calling.
+
+Confidence:
+  VERY HIGH.  1675 is structurally the NEC BCDADD routine; its helper bodies
+  also match the published DADDS/DSUBS implementation, with Kenwood's error
+  branches changed to the local bare-RET target at 1709.
+
+
+1F09 -> 1666 : signed 8-digit packed-BCD subtraction
+----------------------------------------------------
+Identification:
+  Kenwood's copy/adaptation of NEC's published BCDSUB routine.
+
+Operation:
+  *HL = *HL - *DE
+
+Input:
+  HL = low address of 4-byte MINUEND / RESULT area
+  DE = low address of 4-byte SUBTRAHEND area
+
+Data format:
+  Same signed four-byte packed-BCD format used by 1F06.
+  Valid numeric range is -79,999,999 through +79,999,999.
+
+Output:
+  Four-byte signed packed-BCD result is written IN PLACE to:
+
+    [original HL+0 .. original HL+3]
+
+How it works:
+  1F09 is a very small wrapper around the 1F06/BCDADD implementation:
+
+    C = 4
+    B = C - 1 = 3
+    invert bit 7 of [DE+B]      ; invert sign of subtrahend
+    call the BCDADD body
+    return
+
+Operand side effects -- IMPORTANT:
+  The routine writes the sign bit of the DE/subtrahend operand before doing
+  the add/subtract operation.  The reused BCDADD subtraction helper may also
+  clear that sign bit while normalizing operands.
+
+  Therefore the DE source operand is NOT a const operand.  Do not assume its
+  sign byte is unchanged after the call.  If the original subtrahend must be
+  preserved exactly, copy it first.
+
+Register / flag notes:
+  Same practical clobber rules as 1F06:
+  - A, B, C, DE, HL and scratch/status state are used
+  - PSWH.7 is used internally as a sign flag
+  - DE and HL pointer values are not preserved
+  - packed-BCD digit validity is assumed
+
+Overflow behavior:
+  Same as 1F06.  Kenwood's version returns through the bare RET at 1709 where
+  NEC's reference implementation expected an ERROR handler.  There is no
+  reliable universal overflow-status output.  Range-check beforehand if an
+  overflow result is possible.
+
+Confidence:
+  VERY HIGH.  1666 matches NEC's BCDSUB wrapper exactly in structure and then
+  enters the same resident BCDADD body used by 1F06.
+
+
+1F0C -> 010C : clear internal working RAM
+-----------------------------------------
+Purpose:
+  Clears the main resident working-RAM area used by the firmware.
+
+Inputs:
+  None.
+
+Code operation:
+  A  = 00h
+  DE = FE20h
+  C  = D0h
+  MOVM [DE+],A
+
+MOVM repeats until C reaches zero, so exactly D0h (208) bytes are cleared.
+
+Output / side effects:
+  FE20h through FEEFh inclusive = 00h
+
+Defined final scratch-register state:
+  A  = 00h
+  C  = 00h
+  DE = FEF0h
+
+No other memory is intentionally cleared by this entry.
+
+Calling notes:
+  Obviously destructive to FE20-FEEF.  This is appropriate during startup,
+  but it is not a harmless utility call once application state is live.
+
+Confidence:
+  VERY HIGH.  The routine is only five instructions and MOVM semantics are
+  defined by the NEC 78K/III instruction set.
+
+
+1F0F -> 00ED : baseline port / GPIO initialization
+---------------------------------------------------
+Purpose:
+  Establishes a common baseline state for CPU ports and port mode/function
+  registers.  Model/mode-specific startup code can override individual values
+  afterward; for example, the programming-monitor startup changes PM1 after
+  calling this routine.
+
+Inputs:
+  None.
+
+Outputs / hardware side effects:
+
+  Port output latches:
+    P0   = F1h
+    P1   = 7Fh
+    P2   = 7Fh
+    P3   = BFh
+
+  Port mode registers:
+    PM0  = 60h
+    PM1  = 7Bh
+    PM2  = AFh
+    PM3  = 4Fh
+
+  Port mode-control/function registers:
+    PMC2 = BFh
+    PMC3 = 3Fh
+
+Register effects:
+  The routine consists of immediate stores to the port/SFR registers followed
+  by RET.  It does not use a general-purpose register as an argument or
+  result, and it does not intentionally clobber A/AX, BC, DE, or HL.
+
+Calling notes:
+  This changes physical I/O direction/function/output state and therefore is
+  a hardware-initialization routine, not a pure software helper.
+
+Confidence:
+  VERY HIGH.  All stores and SFR destinations are explicit in the mask-ROM
+  code.
+
+
+Summary for replacement-firmware use
+------------------------------------
+The six 1F0x entries can now be treated as follows:
+
+  1F00  noreturn programming monitor
+  1F03  reusable uint16 -> four-digit packed-BCD conversion
+  1F06  reusable signed packed-BCD add, but destructive/special overflow rules
+  1F09  reusable signed packed-BCD subtract, destructive source sign byte
+  1F0C  startup RAM clear; destructive to FE20-FEEF
+  1F0F  baseline hardware port initialization
+
+There are no unidentified 1F0x trampoline entries remaining in this range.
+
+Reference correlation
+---------------------
+The routines at 1604, 1675 and 1666 correspond to routines published by NEC
+for the 78K/III family in the application note "78K/III Series (Software
+Basic)":
+
+  THXBCD  - transform BCD <- HEX
+  BCDADD  - signed 8-digit decimal addition
+  BCDSUB  - signed 8-digit decimal subtraction
+
+The resident code is not merely similar in purpose; its control flow and core
+instruction sequences track those published routines closely.  Kenwood's
+notable modification to BCDADD is replacing the reference ERROR branches with
+a local bare RET at 1709.
