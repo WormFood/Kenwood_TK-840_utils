@@ -2,7 +2,7 @@
 
 Reverse-engineering notes and utilities for the Kenwood TK-840 family of commercial mobile radios, centered on the TK-840 and its shared CPU/firmware architecture with the TK-940 and TK-941.
 
-The current utility, `tk840dump`, is intentionally **read only**. It can dump named memory regions or arbitrary 16-bit address ranges through the radio's programming interface and can compare a saved image byte-for-byte against the live radio.
+The current utility, `tk840download`, is intentionally **read only**. It can dump named memory regions or arbitrary 16-bit address ranges through the radio's programming interface and can compare a saved image byte-for-byte against the live radio.
 
 The project also documents the main CPU's internal mask ROM, the external Flash layout, the programming protocol, the resident firmware-loader, and the mask-ROM trampoline/API table at `0x1F00-0x1F4B`.
 
@@ -101,32 +101,32 @@ FF00-FFFF   Special-function registers
 
 ### Warning about RAM and SFR reads
 
-`tk840dump` is read-only at the Kenwood programming-protocol level, but not every CPU address is necessarily safe to read.
+`tk840download` is read-only at the Kenwood programming-protocol level, but not every CPU address is necessarily safe to read.
 
 Internal RAM is live working memory and may change while a dump is in progress.
 
 Reading arbitrary SFRs in `0xFF00-0xFFFF` may have hardware side effects, access undefined registers, or otherwise affect radio operation. The program intentionally permits these reads for reverse-engineering work, but prints a warning.
 
-## `tk840dump`
+## `tk840download`
 
-`tk840dump` is a Linux/POSIX command-line utility for reading the radio through the Kenwood programming interface.
+`tk840download` is a Linux/POSIX command-line utility for reading the radio through the Kenwood programming interface.
 
 It **does not contain a radio write command**.
 
 ### Build
 
 ```sh
-gcc -std=c11 -O2 -Wall -Wextra -Wpedantic -o tk840dump tk840dump.c
+gcc -std=c11 -O2 -Wall -Wextra -Wpedantic -o tk840download tk840download.c
 ```
 
 ### Named regions
 
 ```sh
-./tk840dump /dev/ttyUSB0 bootrom  bootrom.bin
-./tk840dump /dev/ttyUSB0 program  firmware.bin
-./tk840dump /dev/ttyUSB0 channels codeplug.bin
-./tk840dump /dev/ttyUSB0 ram      ram.bin
-./tk840dump /dev/ttyUSB0 sfr      sfr.bin
+./tk840download /dev/ttyUSB0 bootrom  bootrom.bin
+./tk840download /dev/ttyUSB0 program  firmware.bin
+./tk840download /dev/ttyUSB0 channels codeplug.bin
+./tk840download /dev/ttyUSB0 ram      ram.bin
+./tk840download /dev/ttyUSB0 sfr      sfr.bin
 ```
 
 Aliases are also accepted:
@@ -143,9 +143,9 @@ registers / regs    -> sfr
 Start and end addresses are inclusive:
 
 ```sh
-./tk840dump /dev/ttyUSB0 0x0000 0x1fff bootrom.bin
-./tk840dump /dev/ttyUSB0 0x8000 0xe5ff firmware.bin
-./tk840dump /dev/ttyUSB0 0xe600 0xfdff codeplug.bin
+./tk840download /dev/ttyUSB0 0x0000 0x1fff bootrom.bin
+./tk840download /dev/ttyUSB0 0x8000 0xe5ff firmware.bin
+./tk840download /dev/ttyUSB0 0xe600 0xfdff codeplug.bin
 ```
 
 The radio read protocol has only been verified using `0x80`-byte transactions. For an unaligned/manual range, the utility reads complete 128-byte blocks and saves only the requested bytes.
@@ -155,15 +155,15 @@ The radio read protocol has only been verified using `0x80`-byte transactions. F
 `validate` performs a complete live read and compares it byte-for-byte with an existing file.
 
 ```sh
-./tk840dump /dev/ttyUSB0 validate bootrom bootrom.bin
-./tk840dump /dev/ttyUSB0 validate program firmware.bin
-./tk840dump /dev/ttyUSB0 validate channels codeplug.bin
+./tk840download /dev/ttyUSB0 validate bootrom bootrom.bin
+./tk840download /dev/ttyUSB0 validate program firmware.bin
+./tk840download /dev/ttyUSB0 validate channels codeplug.bin
 ```
 
 Manual ranges are also supported:
 
 ```sh
-./tk840dump /dev/ttyUSB0 validate 0x8000 0xe5ff firmware.bin
+./tk840download /dev/ttyUSB0 validate 0x8000 0xe5ff firmware.bin
 ```
 
 Validation is also read-only. It never writes the supplied file to the radio.
@@ -293,7 +293,7 @@ A tested TK-840 may return no byte after `E`, so the utility does not require an
 
 ## Normal codeplug writes
 
-Although `tk840dump` does not write, the normal KPG programming monitor has also been reverse engineered.
+Although `tk840download` does not write, the normal KPG programming monitor has also been reverse engineered.
 
 A normal write transaction uses:
 
@@ -462,7 +462,7 @@ Reverse engineered but not implemented in the current read-only utility:
 
 This project is experimental reverse-engineering software.
 
-`tk840dump` is intentionally read-only and does not send the radio's `W` command. A separate write-capable utility may be developed later rather than weakening the safety properties of the reader.
+`tk840download` is intentionally read-only and does not send the radio's `W` command. A separate write-capable utility may be developed later rather than weakening the safety properties of the reader.
 
 Even with a read-only protocol, arbitrary CPU reads are not necessarily harmless. In particular, SFR reads may cause hardware side effects.
 
