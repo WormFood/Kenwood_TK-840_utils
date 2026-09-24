@@ -149,3 +149,8 @@ Offline use also supports the menu:
 ./tk941patch --model M941B1 \
     file TK-941_firmware.bin TK-941_ham.bin tk941patches.tkpatch
 ```
+
+
+## Friendly `--model` names
+
+For unknown firmware revisions, `--model` accepts `840`, `940`, or `941`, with optional `TK` prefixes/separators, plus exact internal IDs such as `M941B1`. Examples: `tk840`, `tk-840`, `TK 840`, `TK-840-1`, `tk941`, `tk-941`, and `M941B1`. TK-840 B1/B2/B3 forms are accepted. 890 is not a user-facing model alias.

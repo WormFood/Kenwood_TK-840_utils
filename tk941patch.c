@@ -14,7 +14,7 @@
  *     --force-unsafe is explicitly supplied.
  *   - Full firmware readback verification is required after live writes.
  *
- * External patch file format (TKPATCH v2):
+ * External patch file format (TKPATCH):
  *
  *   [patch example-name]
  *   description = Human-readable description
@@ -76,7 +76,7 @@
 #define MAX_PATCH_FILES 32
 #define MAX_CONTEXT_BYTES 64
 #define SHA256_HEX_LEN 64
-#define TK941PATCH_VERSION "5"
+#define TK941PATCH_VERSION "7"
 
 struct hunk {
     uint16_t addr;
@@ -732,6 +732,67 @@ static void print_hex_bytes(FILE *f,const uint8_t*p,size_t n){size_t i;for(i=0;i
 static void list_patches(void){struct patch*p;for(p=patches;p;p=p->next){unsigned n=0;struct hunk*h;for(h=p->hunks;h;h=h->next)n++;printf("%-24s %s\n",p->name,p->builtin?"[built-in]":"[external]");if(*p->description)printf("  %s\n",p->description);printf("  model=%s sum16=",*p->model?p->model:"*");if(p->has_sum16)printf("%04X",p->sum16);else printf("*");printf(" sha256=%s hunks=%u\n",p->has_sha256?p->sha256:"*",n);}}
 static void show_patch(const struct patch*p){const struct hunk*h;printf("Patch: %s%s\n",p->name,p->builtin?" [built-in]":"");if(*p->description)printf("Description: %s\n",p->description);printf("Model: %s\n",*p->model?p->model:"*");printf("Source sum16: %s",p->has_sum16?"":"*\n");if(p->has_sum16)printf("%04X\n",p->sum16);printf("Source SHA-256: %s\n",p->has_sha256?p->sha256:"*");for(h=p->hunks;h;h=h->next){printf("  %04X: ",h->addr);print_hex_bytes(stdout,h->old_bytes,h->len);printf(" -> ");print_hex_bytes(stdout,h->new_bytes,h->len);printf("\n");if(h->before_len){printf("    before: ");print_hex_bytes(stdout,h->before,h->before_len);printf("\n");}if(h->after_len){printf("    after:  ");print_hex_bytes(stdout,h->after,h->after_len);printf("\n");}}}
 
+static int normalize_model_arg(const char *input, char out[16])
+{
+    char compact[32];
+    size_t i, n = 0;
+    const char *s;
+    int model, split = 0;
+
+    if (!input || !*input)
+        return -1;
+
+    for (i = 0; input[i] && n + 1 < sizeof(compact); ++i) {
+        unsigned char c = (unsigned char)input[i];
+        if (isalnum(c))
+            compact[n++] = (char)toupper(c);
+    }
+    compact[n] = '\0';
+    s = compact;
+
+    if (!strncmp(s, "TK", 2))
+        s += 2;
+    else if (*s == 'M')
+        ++s;
+
+    if (!strncmp(s, "840", 3))
+        model = 840;
+    else if (!strncmp(s, "940", 3))
+        model = 940;
+    else if (!strncmp(s, "941", 3))
+        model = 941;
+    else
+        return -1;
+    s += 3;
+
+    if (*s == '\0') {
+        if (model == 840)
+            strcpy(out, "M840B");       /* any TK-840 RF split */
+        else
+            snprintf(out, 16, "M%dB1", model);
+        return 0;
+    }
+
+    if (*s == 'B')
+        ++s;
+    if (*s >= '1' && *s <= '3') {
+        split = *s++ - '0';
+    } else {
+        return -1;
+    }
+
+    /* Accept a trailing N/Y from the seven-character PROGRAM-mode identity. */
+    if ((*s == 'N' || *s == 'Y') && s[1] == '\0')
+        ++s;
+    if (*s != '\0')
+        return -1;
+
+    if (model != 840 && split != 1)
+        return -1;
+    snprintf(out, 16, "M%dB%d", model, split);
+    return 0;
+}
+
 static int model_matches(const char *want, const char *actual)
 {
     size_t n;
@@ -739,8 +800,17 @@ static int model_matches(const char *want, const char *actual)
         return 1;
     if (!actual || !*actual)
         return 0;
+
+    /* Normal exact/prefix match, including live IDs such as M941B1Y. */
     n = strlen(want);
-    return !strncmp(want, actual, n);
+    if (!strncmp(want, actual, n))
+        return 1;
+
+    /* A friendly bare "840" normalizes to M840B and means any B1/B2/B3 split. */
+    n = strlen(actual);
+    if (n && actual[n - 1] == 'B' && !strncmp(want, actual, n))
+        return 1;
+    return 0;
 }
 
 static int hunk_context_matches(const struct hunk*h,const uint8_t*image,uint16_t addr){size_t o=addr-PROGRAM_START;if(h->before_len){if(o<h->before_len||memcmp(image+o-h->before_len,h->before,h->before_len))return 0;}if(h->after_len){if(o+h->len+h->after_len>PROGRAM_SIZE||memcmp(image+o+h->len,h->after,h->after_len))return 0;}return 1;}
@@ -767,8 +837,8 @@ static int resolve_patch(struct patch*p,const uint8_t*image,const char*sha,const
    }
    return -1;}}
  return 0;}
-static int patch_apply_one(struct patch*p,uint8_t*image,const uint8_t*source_image,const char*model,uint16_t source_sum,const char*source_sha,const struct options*opt,size_t*changed_bytes){struct hunk*h;size_t local=0,total=0,nold=0,nnew=0;if(*p->model&&model&&*model&&!model_matches(p->model,model)){fprintf(stderr,"Patch %s requires model %s; current model is %s.\n",p->name,p->model,model);return -1;}if(*p->model&&(!model||!*model)&&!opt->relaxed_identity){fprintf(stderr,"Patch %s requires model %s; use --model for offline patching.\n",p->name,p->model);return -1;}
- if(p->has_sha256&&!strcmp(p->sha256,source_sha))fprintf(stderr,"Patch %s: SHA-256 identifies known source firmware.\n",p->name);else if(p->has_sha256)fprintf(stderr,"Patch %s: source SHA-256 differs from the original definition; resolving exact patch state/context.\n",p->name);
+static int patch_apply_one(struct patch*p,uint8_t*image,const uint8_t*source_image,const char*model,uint16_t source_sum,const char*source_sha,const struct options*opt,size_t*changed_bytes){struct hunk*h;size_t local=0,total=0,nold=0,nnew=0;int sha_known=p->has_sha256&&!strcmp(p->sha256,source_sha);if(*p->model&&model&&*model&&!model_matches(p->model,model)){fprintf(stderr,"Patch %s requires model %s; current model is %s.\n",p->name,p->model,model);return -1;}if(*p->model&&(!model||!*model)&&!sha_known&&!opt->relaxed_identity){fprintf(stderr,"Patch %s requires model %s for an unknown firmware revision; use --model for offline contextual matching.\n",p->name,p->model);return -1;}
+ if(sha_known)fprintf(stderr,"Patch %s: SHA-256 identifies known source firmware; model identity is implicit.\n",p->name);else if(p->has_sha256)fprintf(stderr,"Patch %s: source SHA-256 differs from the original definition; resolving exact patch state/context.\n",p->name);
  if(resolve_patch(p,source_image,source_sha,opt,1)<0)return -1;
  if(p->has_sum16&&source_sum!=p->sum16&&p->has_sha256&&!strcmp(p->sha256,source_sha)){fprintf(stderr,"Patch %s: internal identity conflict (SHA matches, sum16 differs).\n",p->name);return -1;}
  for(h=p->hunks;h;h=h->next){total++;if(h->source_was_new)nnew++;else nold++;}
@@ -816,7 +886,12 @@ static int patch_candidate_status(struct patch *p, const uint8_t *image,
 
     if (*p->model && model && *model && !model_matches(p->model, model))
         return 0;
-    if (*p->model && (!model || !*model) && !opt->relaxed_identity)
+    /* For offline images, an exact SHA-256 match is stronger identity than a
+     * separately supplied model string.  Only unknown revisions need --model
+     * before contextual relocation is considered. */
+    if (*p->model && (!model || !*model) &&
+        !(p->has_sha256 && !strcmp(p->sha256, source_sha)) &&
+        !opt->relaxed_identity)
         return 0;
     if (resolve_patch(p, image, source_sha, opt, 0) < 0)
         return 0;
@@ -1431,7 +1506,8 @@ static void usage(const char *prog)
         "                          A positional *.tkpatch file is also loaded automatically.\n"
         "                          With no explicit patch names, a matching-patch menu is shown.\n"
         "  --dry-run               compare/apply in memory only; never write radio/file\n"
-        "  --model MODEL           offline model identity, e.g. M941B1\n"
+        "  --model MODEL           model for unknown offline revisions; accepts friendly forms\n"
+        "                          such as 941, tk941, tk-941, TK 941, or M941B1\n"
         "  --backup FILE           save live pre-patch firmware before radio write\n"
         "  --learn FILE            write revision-specific TKPATCH definitions\n"
         "  --relaxed-identity      permit unique byte-only fallback if exact context cannot match\n"
@@ -1475,6 +1551,7 @@ int main(int argc, char **argv)
     int patch_file_count = 0;
     int argi = 1, i, rc = 1;
     const char *cmd;
+    char offline_model_buf[16] = {0};
 
     memset(&opt, 0, sizeof(opt));
     add_builtin_patches();
@@ -1500,7 +1577,12 @@ int main(int argc, char **argv)
                 usage(argv[0]);
                 goto out;
             }
-            opt.offline_model = argv[argi++];
+            if (normalize_model_arg(argv[argi], offline_model_buf) < 0) {
+                fprintf(stderr, "Unsupported model '%s'. Use 840, 940, 941, tk-840, tk-940, tk-941, or an exact MxxxBx form.\n", argv[argi]);
+                goto out;
+            }
+            opt.offline_model = offline_model_buf;
+            ++argi;
         } else if (!strcmp(argv[argi], "--backup")) {
             if (++argi >= argc) { usage(argv[0]); goto out; }
             opt.backup_path = argv[argi++];
