@@ -10,6 +10,7 @@ Firmware patches are available for the **TK-941** to make it behave more like a 
 
 Most importantly, the patched firmware can be made to **honor the programmed TX frequency field**, instead of forcing the factory hard-coded repeater offset behavior. This makes the radio much more practical for amateur use and allows arbitrary transmit/receive frequency pairs where the hardware permits them.
 
+This radio has been around forever! Why has nobody done this before me?
 Additional patches and firmware experiments are being developed as the firmware is reverse engineered.
 
 ## Tools
