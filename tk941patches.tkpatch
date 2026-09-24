@@ -1,0 +1,27 @@
+# TKPATCH v2
+# Known TK-941 B5EC firmware
+# Source SHA-256: 1005ad3f16f127a8bd8613fd3168a2f8285ceedebb378b6c9f9f87786cb61818
+
+[patch b5ec-txfield]
+description = TK-941 B5EC: use the stored channel TX-frequency word directly
+model = M941B1
+sum16 = B5EC
+sha256 = 1005ad3f16f127a8bd8613fd3168a2f8285ceedebb378b6c9f9f87786cb61818
+replace 0x9C6E : 28 9D 9C 71 9E 0A 2D F0 09 1A 20 3A 22 01 14 18 -> 28 9A DE 83 29 60 03 00 88 E8 59 24 01 5D 03 9F
+before = 00 28 59 9B 28 46 9D 56
+after = 08 A0 DA 05 2D E0 FB 14
+
+[patch b5ec-25mhz]
+description = TK-941 B5EC: change stock fixed split from 39 MHz to 25 MHz; conventional TX is bypassed when the TX-field patch is active
+model = M941B1
+sum16 = B5EC
+sha256 = 1005ad3f16f127a8bd8613fd3168a2f8285ceedebb378b6c9f9f87786cb61818
+replace 0x9AB6 : 2D C0 FD -> 2D 20 02
+before = 1A 20 3A 22 01 14 18 08 A0 DA 05 2D E0 FB 14 03
+after = 1A 20 82 05 3A 22 01 14 03 3A 22 00 28 59 9B 28
+replace 0x9C58 : 2D C0 FD -> 2D 20 02
+before = 1A 20 3A 22 01 14 18 08 A0 DA 05 2D E0 FB 14 03
+after = 1A 20 82 05 3A 22 01 14 03 3A 22 00 28 59 9B 28
+replace 0x9C87 : 2D C0 FD -> 2D 20 02
+before = 1A 20 3A 22 01 14 18 08 A0 DA 05 2D E0 FB 14 03
+after = 1A 20 82 05 3A 22 01 14 03 3A 22 00 28 59 9B 28
